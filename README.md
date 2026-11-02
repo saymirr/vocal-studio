@@ -8,7 +8,9 @@ It's a single file, [`index.html`](index.html), with no dependencies and no buil
 
 ## Quick start
 
-**Easiest:** download `index.html` and double-click it (Chrome or Edge recommended).
+**Use it online:** <https://saymirr.github.io/vocal-studio/> (deployed automatically from `main`; everything still runs locally in your browser, and your audio is never uploaded).
+
+**Or run it yourself — easiest:** download `index.html` and double-click it (Chrome or Edge recommended).
 
 **If the microphone doesn't work from a double-clicked file**, serve it locally:
 
@@ -77,4 +79,4 @@ The tests in [`tests/app.test.js`](tests/app.test.js) load the page in headless 
 
 ### Continuous integration
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the test suite on every push to `main` and on every pull request, and uploads a screenshot of the pitch graph as a build artifact.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the test suite on every push to `main` and on every pull request, and uploads a screenshot of the pitch graph as a build artifact. [`.github/workflows/pages.yml`](.github/workflows/pages.yml) publishes `index.html` to GitHub Pages on every push to `main`.
