@@ -1,0 +1,80 @@
+# Vocal Studio
+
+[![CI](https://github.com/saymirr/vocal-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/saymirr/vocal-studio/actions/workflows/ci.yml)
+
+A free vocal mixing and mastering studio that runs entirely in your browser. Record or import vocals, clean them up, tune them, mix them over a beat, master the result and export a WAV — no account, no install, no upload. Your audio never leaves your computer.
+
+It's a single file, [`index.html`](index.html), with no dependencies and no build step. It uses the Web Audio API and works offline.
+
+## Quick start
+
+**Easiest:** download `index.html` and double-click it (Chrome or Edge recommended).
+
+**If the microphone doesn't work from a double-clicked file**, serve it locally:
+
+```bash
+# macOS / Linux
+python3 -m http.server 8000
+
+# Windows
+python -m http.server 8000
+```
+
+then open <http://localhost:8000>.
+
+## Features
+
+| Area | What you get |
+| --- | --- |
+| **Input** | Record from your microphone (with backing tracks playing), import audio or video files, drag and drop. Multi-track, with per-track volume, pan, mute, solo and a millisecond offset to fix recording latency. |
+| **Clean-up** | Low-cut filter, input trim, and a **noise gate** with look-ahead (so word onsets aren't clipped), hold, attack, release and reduction depth. |
+| **Auto-tune** | Pitch correction to a chosen key and scale (chromatic, major, minor, pentatonic, blues). Retune speed from 0 ms (hard, robotic) to 400 ms (natural) and an amount control. |
+| **Pitch graph** | Piano-roll view of the detected notes, the raw pitch curve and the corrected curve, with a moving playhead and a hover read-out (note, cents, Hz). |
+| **Vocal chain** | 3-band EQ with presence and air, split-band **de-esser**, compressor, warmth (saturation), delay and reverb. Presets for pop, rap, airy, warm, lo-fi and harsh voices. |
+| **Mastering** | Master EQ, glue compressor, limiter with a hard ceiling, loudness drive and presets. |
+| **Loudness** | Live peak meter, integrated LUFS analysis, and **Auto-level** to -14 / -16 / -11 / -9 LUFS. |
+| **Export** | 16-bit (dithered) or 24-bit WAV. |
+| **Projects** | Save and open `.vstudio` files containing your audio and every setting. |
+
+## Using it
+
+1. **Add audio** with *Import audio* or *Record*. Wear headphones when recording over a beat, and use the *ms* field on the track to nudge a take that sounds late.
+2. **Shape each track** in the *Track FX* tab: gate → EQ → de-esser → compressor → warmth/delay/reverb. Double-click any slider to reset it.
+3. **Tune it** (optional): open the *Pitch graph* tab, press *Analyze pitch*, set the key and scale, enable *Auto-tune* and watch the corrected curve snap to the notes.
+4. **Master the mix** in the *Master / Mastering* tab, then use *Auto-level master* to hit a loudness target.
+5. **Export** the mix as WAV, and **Save project** (Ctrl+S) to come back to it later.
+
+Keyboard: `Space` play/pause, `Home` go to start, `Ctrl+S` save project.
+
+## Project files (`.vstudio`)
+
+A single binary file: the magic string `VSTUDIO1`, a little-endian `uint32` length, a JSON document (track and master settings, plus where each track's audio lives), then the raw 32-bit float PCM of each track's **original, unprocessed** audio. Gate and auto-tune are stored as settings and re-applied when a project is opened, so saving is lossless and re-tuning stays editable. Projects are about as large as the raw audio (roughly 10 MB per minute for a mono track at 48 kHz).
+
+## How it works
+
+- **Live signal chain:** per-track Web Audio graph (filters, split-band compressor, dynamics, convolution reverb) feeding a master chain. The same builder functions are used for playback and for the offline render, so what you hear is what you export.
+- **Noise gate:** an offline, look-ahead processor on 1 ms blocks with linear-in-dB ramps.
+- **Auto-tune:** YIN pitch detection on a decimated mono mix, pitch-mark placement on glottal peaks, then time-domain PSOLA to re-space the grains at the corrected period (duration is preserved). Pitch analysis is cached per track, so changing key, scale or speed re-renders quickly.
+- **Loudness:** K-weighted, gated integrated loudness following the ITU-R BS.1770 method (approximate filter implementation), used by *Analyze loudness* and *Auto-level*.
+
+## Limitations
+
+- Auto-tune works best on a **dry, solo, monophonic** vocal. Heavy reverb, harmonies or backing music in the same track will confuse the pitch tracker. It is a practical corrector, not a replacement for commercial tools on extreme corrections.
+- The LUFS figure is an approximation; verify against a dedicated meter if a platform is strict.
+- No cloud saving, collaboration, sample library or mobile app, and no autosave — save with Ctrl+S before closing the tab.
+
+## Development
+
+There is no build step; edit `index.html` and reload.
+
+```bash
+npm install
+npx playwright install chromium   # first time only
+npm test
+```
+
+The tests in [`tests/app.test.js`](tests/app.test.js) load the page in headless Chromium and exercise the audio engine with synthetic signals: noise gate depth, auto-tune accuracy, loudness targeting, WAV output, project round-trips and the pitch graph. If your machine already has a Chromium binary, point `CHROMIUM_PATH` at it instead of installing one.
+
+### Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the test suite on every push to `main` and on every pull request, and uploads a screenshot of the pitch graph as a build artifact.
