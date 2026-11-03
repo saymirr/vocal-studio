@@ -196,6 +196,72 @@ async function check(name, fn) {
     assert.ok(px > 150, 'expected a teal spectrum trace, found ' + px + ' px');
   });
 
+  await check('undo / redo steps through track, master and delete changes', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app; A.S.tracks.length = 0; A.S.master.drive = 0; A.resetHistory();
+      const undoDisabledAtStart = document.querySelector('#btnUndo').disabled;
+      const t = A.newTrack('Vox', harm(48000, 2, () => ({ f: 226, amp: .2 })), 0), id = t.id, orig = t.orig; A.commitHistory();
+      t.vol = -6; A.refreshAll(); A.commitHistory();
+      t.fx.midG = 4; A.refreshAll(); A.commitHistory();
+      A.S.master.drive = 7; A.refreshAll(); A.commitHistory();
+      const o = { undoDisabledAtStart, steps: A.H.stack.length };
+      A.undo(); o.drive = A.S.master.drive;
+      A.undo(); o.midG = A.S.tracks[0].fx.midG;
+      A.undo(); o.vol = A.S.tracks[0].vol;
+      A.redo(); A.redo(); A.redo();
+      o.redone = { vol: A.S.tracks[0].vol, midG: A.S.tracks[0].fx.midG, drive: A.S.master.drive };
+      // delete the track, then bring it back
+      document.querySelector('.lane .head .mini:last-child').click(); A.commitHistory();
+      o.afterDelete = A.S.tracks.length;
+      A.undo();
+      const back = A.S.tracks[0];
+      o.restored = { n: A.S.tracks.length, sameId: back && back.id === id, sameAudio: back && back.orig === orig, vol: back && back.vol, hasChain: back && !!window.__app.S && true };
+      // a new edit after an undo discards the redo branch
+      A.undo(); back.vol = -1; A.refreshAll(); A.commitHistory();
+      o.redoDisabled = document.querySelector('#btnRedo').disabled;
+      return o;
+    });
+    assert.equal(r.undoDisabledAtStart, true); assert.equal(r.steps, 5);
+    assert.equal(r.drive, 0); assert.equal(r.midG, 0); assert.equal(r.vol, 0);
+    assert.deepEqual(r.redone, { vol: -6, midG: 4, drive: 7 });
+    assert.equal(r.afterDelete, 0);
+    assert.deepEqual([r.restored.n, r.restored.sameId, r.restored.sameAudio, r.restored.vol], [1, true, true, -6]);
+    assert.equal(r.redoDisabled, true);
+  });
+
+  await check('undo / redo re-derives noise-gate output instead of storing copies', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app; A.S.tracks.length = 0; A.resetHistory();
+      const t = A.newTrack('Gated', harm(48000, 2, () => ({ f: 220, amp: .2 })), 0); A.commitHistory();
+      const until = async f => { for (let i = 0; i < 60 && !f(); i++) await new Promise(r => setTimeout(r, 50)); return f(); };
+      t.fx.ngT = -40; A.markDirty(); await A.processTrack(t); A.commitHistory();
+      const o = { gated: t.buffer !== t.orig };
+      A.undo(); o.ungated = await until(() => t.buffer === t.orig);
+      A.redo(); o.regated = await until(() => t.buffer !== t.orig);
+      return o;
+    });
+    assert.deepEqual(r, { gated: true, ungated: true, regated: true });
+  });
+
+  await check('undo / redo: slider drags merge into one step; Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y work', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app; A.S.tracks.length = 0; A.resetHistory();
+      const t = A.newTrack('Kb', harm(48000, 1, () => ({ f: 220, amp: .2 })), 0); A.commitHistory();
+      const before = A.H.idx;
+      for (const v of [-1, -2, -3, -4, -5]) { t.vol = v; A.refreshAll(); await new Promise(r => setTimeout(r, 60)); }   // one continuous drag
+      await new Promise(r => setTimeout(r, 1000));
+      document.activeElement && document.activeElement.blur();
+      return { steps: A.H.idx - before };
+    });
+    assert.equal(r.steps, 1, 'five quick edits should be a single undo step');
+    await page.keyboard.press('Control+z');
+    assert.equal(await page.evaluate(() => window.__app.S.tracks[0].vol), 0, 'Ctrl+Z');
+    await page.keyboard.press('Control+Shift+Z');
+    assert.equal(await page.evaluate(() => window.__app.S.tracks[0].vol), -5, 'Ctrl+Shift+Z');
+    await page.keyboard.press('Control+z'); await page.keyboard.press('Control+y');
+    assert.equal(await page.evaluate(() => window.__app.S.tracks[0].vol), -5, 'Ctrl+Y');
+  });
+
   await check('no errors were logged during the whole run', async () => {
     assert.deepEqual(errors, []);
   });

@@ -36,6 +36,7 @@ then open <http://localhost:8000>.
 | **Mastering** | Master EQ, glue compressor, limiter with a hard ceiling, loudness drive and presets. |
 | **Loudness** | Live peak meter, integrated LUFS analysis, and **Auto-level** to -14 / -16 / -11 / -9 LUFS. |
 | **Spectrum** | Live log-frequency spectrum of the master output with peak hold and a marked sibilance zone. |
+| **Undo / redo** | Up to 80 steps for every setting, mute/solo, clip move, rename, add/delete track and the whole master chain. A slider drag counts as one step, a deleted track comes back with its audio, and gate/auto-tune are re-applied automatically. `Ctrl+Z` / `Ctrl+Shift+Z` (or `Ctrl+Y`). |
 | **Timeline** | Drag clips to reposition them, drag on the ruler to set a **loop region**, click the ruler to seek. |
 | **Export** | 16-bit (dithered) or 24-bit WAV of the mix, or **stems**: one WAV per track in a `.zip`, all the same length so they line up in any DAW. |
 | **Projects** | Save and open `.vstudio` files containing your audio and every setting. **Autosave** keeps a recovery copy in your browser every 10 seconds and offers to restore it if the tab was closed. |
@@ -48,7 +49,7 @@ then open <http://localhost:8000>.
 4. **Master the mix** in the *Master / Mastering* tab, then use *Auto-level master* to hit a loudness target.
 5. **Export** the mix as WAV, and **Save project** (Ctrl+S) to come back to it later.
 
-Keyboard: `Space` play/pause, `Home` go to start, `Ctrl+S` save project.
+Keyboard: `Space` play/pause, `Home` go to start, `Ctrl+S` save project, `Ctrl+Z` undo, `Ctrl+Shift+Z` / `Ctrl+Y` redo.
 
 **Loop:** drag across the time ruler to select a region (looping turns on), then use the 🔁 Loop button to switch it on or off. **Move a take:** drag its waveform left or right. **Stems:** *Stems (.zip)* exports each track after its own effects but before the master chain, ready for another DAW or an engineer.
 
@@ -79,7 +80,7 @@ npx playwright install chromium   # first time only
 npm test
 ```
 
-The tests in [`tests/app.test.js`](tests/app.test.js) load the page in headless Chromium and exercise the audio engine with synthetic signals: noise gate depth, auto-tune accuracy, loudness targeting, WAV output, project round-trips, the pitch graph, stem ZIP validity, loop playback, clip dragging, autosave/restore and the spectrum analyzer. If your machine already has a Chromium binary, point `CHROMIUM_PATH` at it instead of installing one.
+The tests in [`tests/app.test.js`](tests/app.test.js) load the page in headless Chromium and exercise the audio engine with synthetic signals: noise gate depth, auto-tune accuracy, loudness targeting, WAV output, project round-trips, the pitch graph, stem ZIP validity, loop playback, clip dragging, autosave/restore, the spectrum analyzer and undo/redo. If your machine already has a Chromium binary, point `CHROMIUM_PATH` at it instead of installing one.
 
 ### Continuous integration
 

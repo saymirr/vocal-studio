@@ -50,6 +50,7 @@ header{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 12px;b
 .lane .area canvas{position:absolute;top:0;height:96px;border-radius:4px;opacity:.95}
 #restoreBar{display:flex;gap:10px;align-items:center;padding:6px 12px;background:#2a2410;border-bottom:1px solid #5a4a14;color:#ffd77a}
 #restoreBar[hidden]{display:none}
+button:disabled{opacity:.4;cursor:default;border-color:var(--line)}
 button.on{background:var(--accent2);border-color:var(--accent2);color:#04201b}
 #loopRegion{position:absolute;top:0;bottom:0;z-index:2;pointer-events:none;background:rgba(34,211,182,.07);border-left:2px solid #4b5563;border-right:2px solid #4b5563;display:none}
 #loopRegion.on{background:rgba(34,211,182,.13);border-color:var(--accent2)}
@@ -89,6 +90,9 @@ input[type=range]{accent-color:var(--accent)}
 <body>
 <header>
   <div class="logo">Vocal <b>Studio</b></div>
+  <button id="btnUndo" title="Undo (Ctrl+Z)" disabled>↶ Undo</button>
+  <button id="btnRedo" title="Redo (Ctrl+Shift+Z or Ctrl+Y)" disabled>↷ Redo</button>
+  <div class="sep"></div>
   <button id="btnSave" title="Save project (Ctrl+S)">💾 Save project</button>
   <button id="btnOpen" title="Open a saved project">📂 Open project</button>
   <input id="projFile" type="file" accept=".vstudio" hidden>
@@ -345,7 +349,7 @@ const S = {
   loop: {on: false, a: 0, b: 0}, unsaved: false, autoDirty: false, specView: null,
 };
 let ctx = null, live = null, sources = [], dragSuppress = false;
-function markDirty(){ S.unsaved = true; S.autoDirty = true; }
+function markDirty(){ S.unsaved = true; S.autoDirty = true; scheduleCommit(); }
 
 function ensureCtx(){
   if (!ctx){
@@ -376,7 +380,7 @@ function refreshAll(imm){
 function newTrack(name, buffer, offset){
   const t = {id: S.nextId++, name, buffer, orig: buffer, pitch: null, offset: offset || 0, vol: 0, pan: 0, mute: false, solo: false,
              fx: defaults(TRACK_FX), color: COLORS[(S.nextId - 2) % COLORS.length]};
-  S.tracks.push(t); S.selected = t.id; markDirty();
+  S.tracks.push(t); S.selected = t.id; t.procSig = procSig(t.fx); markDirty();
   if (ctx) attachChain(t);
   renderTracks(); renderPanel();
   return t;
@@ -422,7 +426,7 @@ async function toggleRecord(){
       pause();
       try {
         const ab = await new Blob(chunks, {type: rec.mimeType}).arrayBuffer();
-        t.orig = t.buffer = await ctx.decodeAudioData(ab);
+        t.orig = t.buffer = await ctx.decodeAudioData(ab); markDirty();
         status('Recorded ' + t.buffer.duration.toFixed(1) + 's. If it sounds late vs. the backing, nudge the Offset (ms) on the track.');
       } catch (e){ status('Could not decode recording: ' + e.message, true); S.tracks = S.tracks.filter(x => x !== t); }
       renderTracks();
@@ -761,11 +765,86 @@ async function processTrack(t){
     if (t.pitch.voicedPct < .05) status('Auto-tune: very little pitched audio detected — works best on a dry, solo vocal.', true);
   }
   if (id !== t._proc) return;
-  t.buffer = b;
+  t.buffer = b; t.procSig = procSig(p);
   if (S.playing) play(curPos());
   renderTracks();
   if (S.tab === 'pitch' && S.selected === t.id) renderPanel();
   if (msg.length && t.pitch && t.pitch.voicedPct >= .05 || !p.atOn) status(msg.length ? 'Applied ' + msg.join(' + ') + ' to “' + t.name + '”.' : 'Processing off for “' + t.name + '”.');
+}
+
+/* ---------- undo / redo ----------
+   History = snapshots of the project *state* (track list, every track's settings, master settings). Audio buffers are
+   immutable so snapshots only hold references. Gate / auto-tune output is re-derived on restore via procSig. */
+const H = {stack: [], idx: -1, timer: null, restoring: false};
+const procSig = fx => JSON.stringify([fx.ngT > -80 ? [fx.ngT, fx.ngRange, fx.ngA, fx.ngH, fx.ngR] : 0, fx.atOn ? [fx.atKey, fx.atScale, fx.atSpeed, fx.atAmt] : 0]);
+function snapshot(){
+  const sn = {tracks: S.tracks.map(t => ({id: t.id, name: t.name, color: t.color, offset: t.offset, vol: t.vol, pan: t.pan, mute: t.mute, solo: t.solo, fx: {...t.fx}, orig: t.orig, pitch: t.pitch})),
+              master: {...S.master}, selected: S.selected};
+  sn.sig = JSON.stringify([sn.tracks.map(t => [t.id, t.name, t.offset, t.vol, t.pan, t.mute, t.solo, t.fx, !!t.orig]), sn.master]);
+  return sn;
+}
+function updateHistoryUI(){
+  const busy = !!S.recording;
+  $('#btnUndo').disabled = busy || !(H.idx > 0 || H.timer);
+  $('#btnRedo').disabled = busy || !(H.idx < H.stack.length - 1);
+}
+function scheduleCommit(){ if (H.restoring) return; clearTimeout(H.timer); H.timer = setTimeout(commitHistory, 700); updateHistoryUI(); }   // a slider drag = one step
+function commitHistory(){
+  clearTimeout(H.timer); H.timer = null; if (H.restoring) return;
+  const sn = snapshot(), cur = H.stack[H.idx];
+  if (cur && cur.sig === sn.sig){ cur.selected = sn.selected; updateHistoryUI(); return; }
+  H.stack = H.stack.slice(0, H.idx + 1); H.stack.push(sn);
+  if (H.stack.length > 80) H.stack.shift();
+  H.idx = H.stack.length - 1; updateHistoryUI();
+}
+function resetHistory(){ clearTimeout(H.timer); H.timer = null; H.stack = [snapshot()]; H.stack[0].sig = snapshot().sig; H.idx = 0; updateHistoryUI(); }
+function describeChange(a, b){      // a = state before, b = state after
+  if (b.tracks.length > a.tracks.length) return 'add track “' + b.tracks.find(t => !a.tracks.some(x => x.id === t.id)).name + '”';
+  if (b.tracks.length < a.tracks.length) return 'remove track “' + a.tracks.find(t => !b.tracks.some(x => x.id === t.id)).name + '”';
+  const names = {name: 'rename', offset: 'move clip', vol: 'volume', pan: 'pan', mute: 'mute', solo: 'solo'};
+  for (const tb of b.tracks){
+    const ta = a.tracks.find(x => x.id === tb.id); if (!ta) continue;
+    for (const k in names) if (ta[k] !== tb[k]) return '“' + tb.name + '” ' + names[k];
+    for (const d of TRACK_FX) if (d.k && ta.fx[d.k] !== tb.fx[d.k]) return '“' + tb.name + '”: ' + d.label;
+    if (ta.orig !== tb.orig) return '“' + tb.name + '” audio';
+  }
+  for (const d of MASTER_FX) if (d.k && a.master[d.k] !== b.master[d.k]) return 'master: ' + d.label;
+  return 'change';
+}
+function applySnapshot(sn){
+  H.restoring = true;
+  const wasPlaying = S.playing, pos = curPos(), byId = new Map(S.tracks.map(t => [t.id, t])), next = [], redo = [];
+  for (const st of sn.tracks){
+    let t = byId.get(st.id); byId.delete(st.id);
+    if (!t) t = {id: st.id, buffer: st.orig, orig: st.orig, pitch: st.pitch, procSig: procSig(defaults(TRACK_FX))};     // a deleted track coming back
+    Object.assign(t, {name: st.name, color: st.color, offset: st.offset, vol: st.vol, pan: st.pan, mute: st.mute, solo: st.solo, fx: {...st.fx}});
+    if (!t.pitch && st.pitch) t.pitch = st.pitch;
+    next.push(t);
+  }
+  byId.forEach(t => { if (live && live.chains[t.id]){ live.chains[t.id].out.disconnect(); delete live.chains[t.id]; } });
+  S.tracks = next; Object.assign(S.master, defaults(MASTER_FX), sn.master);
+  S.selected = next.some(t => t.id === sn.selected) ? sn.selected : (next[0] ? next[0].id : null);
+  if (ctx) next.forEach(attachChain);
+  next.forEach(t => { clearTimeout(t._pt); if (t.procSig !== procSig(t.fx)) redo.push(t); });       // gate / tune settings differ from what the buffer was made with
+  S.unsaved = true; S.autoDirty = true;
+  refreshAll(true); renderTracks(); renderPanel();
+  if (wasPlaying) play(pos);
+  H.restoring = false;
+  redo.forEach(t => processTrack(t).catch(e => status('Processing failed: ' + e.message, true)));
+}
+function undo(){
+  if (S.recording) return;
+  if (H.timer) commitHistory();
+  if (H.idx <= 0) return status('Nothing to undo.');
+  const msg = describeChange(H.stack[H.idx - 1], H.stack[H.idx]);
+  H.idx--; applySnapshot(H.stack[H.idx]); updateHistoryUI(); status('Undid: ' + msg + '.');
+}
+function redo(){
+  if (S.recording) return;
+  if (H.timer) commitHistory();
+  if (H.idx >= H.stack.length - 1) return status('Nothing to redo.');
+  const msg = describeChange(H.stack[H.idx], H.stack[H.idx + 1]);
+  H.idx++; applySnapshot(H.stack[H.idx]); updateHistoryUI(); status('Redid: ' + msg + '.');
 }
 
 /* ---------- project save / load (.vstudio) ----------
@@ -807,7 +886,7 @@ async function loadProjectBuffer(ab){
   S.selected = made.length ? made[Math.min(proj.selected || 0, made.length - 1)].id : null;
   refreshAll(true); renderTracks(); renderPanel();
   for (const t of made) if (t.fx.ngT > -80 || t.fx.atOn) await processTrack(t);
-  S.unsaved = false; S.autoDirty = false;
+  S.unsaved = false; S.autoDirty = false; resetHistory();
   return made.length;
 }
 const IDB = {
@@ -1037,7 +1116,7 @@ function renderTracks(){
     const head = el('div', 'head');
     head.onclick = () => { S.selected = t.id; if (S.tab === 'master') S.tab = 'track'; syncTabs(); renderTracks(); renderPanel(); };
     const r1 = el('div', 'r1');
-    const name = el('input'); name.type = 'text'; name.value = t.name; name.onchange = () => t.name = name.value; name.onclick = e => e.stopPropagation();
+    const name = el('input'); name.type = 'text'; name.value = t.name; name.onchange = () => { t.name = name.value; markDirty(); }; name.onclick = e => e.stopPropagation();
     const mb = el('button', 'mini m' + (t.mute ? ' on' : ''), 'M'); mb.title = 'Mute';
     mb.onclick = e => { e.stopPropagation(); t.mute = !t.mute; refreshAll(); renderTracks(); };
     const sb = el('button', 'mini s' + (t.solo ? ' on' : ''), 'S'); sb.title = 'Solo';
@@ -1197,6 +1276,8 @@ function draw(){
 (function loop(){ draw(); drawSpectrum(); requestAnimationFrame(loop); })();
 
 /* ---------- wiring ---------- */
+$('#btnUndo').onclick = undo;
+$('#btnRedo').onclick = redo;
 $('#btnSave').onclick = saveProject;
 $('#btnOpen').onclick = () => $('#projFile').click();
 $('#projFile').onchange = e => { if (e.target.files[0]) openProjectFile(e.target.files[0]); e.target.value = ''; };
@@ -1215,6 +1296,10 @@ $('#btnStems').onclick = () => doStems().catch(e => status(e.message, true));
 document.querySelectorAll('.tab').forEach(b => b.onclick = () => { S.tab = b.dataset.tab; syncTabs(); renderPanel(); });
 document.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.code === 'KeyS'){ e.preventDefault(); saveProject(); return; }
+  if ((e.ctrlKey || e.metaKey) && (e.code === 'KeyZ' || e.code === 'KeyY')){
+    const tg = e.target; if (tg.tagName === 'TEXTAREA' || (tg.tagName === 'INPUT' && /^(text|number)$/.test(tg.type))) return;   // let text fields keep their own undo
+    e.preventDefault(); (e.code === 'KeyY' || e.shiftKey) ? redo() : undo(); return;
+  }
   if (/INPUT|SELECT|TEXTAREA/.test(e.target.tagName) && e.target.type !== 'range') return;
   if (e.code === 'Space'){ e.preventDefault(); S.playing ? pause() : play(S.pos); }
   if (e.code === 'Home') seek(0);
@@ -1227,9 +1312,9 @@ document.addEventListener('drop', e => {
 });
 
 window.addEventListener('beforeunload', e => { if (S.unsaved && S.tracks.some(t => t.orig)){ e.preventDefault(); e.returnValue = ''; } });
-setInterval(autosave, 10000); checkRestore();
+setInterval(autosave, 10000); checkRestore(); resetHistory();
 renderTracks(); renderPanel();
-window.__app = {play, curPos, makeZip, crc32, renderStem, mixTail, autosave, IDB, markDirty, buildProjectBlob, loadProjectBuffer, S, newTrack, renderMix, measure, encodeWav, ensureCtx, doAuto, refreshAll, applyGate, analyzePitch, applyTune, processTrack};
+window.__app = {H, undo, redo, commitHistory, resetHistory, play, curPos, makeZip, crc32, renderStem, mixTail, autosave, IDB, markDirty, buildProjectBlob, loadProjectBuffer, S, newTrack, renderMix, measure, encodeWav, ensureCtx, doAuto, refreshAll, applyGate, analyzePitch, applyTune, processTrack};
 </script>
 </body>
 </html>
