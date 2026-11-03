@@ -19,7 +19,7 @@ async function check(name, fn) {
 }
 
 (async () => {
-  const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined, args: ['--autoplay-policy=no-user-gesture-required', '--no-sandbox'] });
+  const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || undefined, args: ['--autoplay-policy=no-user-gesture-required', '--no-sandbox', '--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream'] });
   const page = await browser.newPage({ viewport: { width: 1280, height: 760 } });
   const errors = [];
   page.on('pageerror', e => errors.push(e.message));
@@ -260,6 +260,97 @@ async function check(name, fn) {
     assert.equal(await page.evaluate(() => window.__app.S.tracks[0].vol), -5, 'Ctrl+Shift+Z');
     await page.keyboard.press('Control+z'); await page.keyboard.press('Control+y');
     assert.equal(await page.evaluate(() => window.__app.S.tracks[0].vol), -5, 'Ctrl+Y');
+  });
+
+  await check('tempo grid: bars ruler and lane lines follow BPM and time signature', async () => {
+    const r = await page.evaluate(() => {
+      const A = window.__app; A.S.tracks.length = 0; A.S.pps = 60; A.setTempo({ bpm: 120, num: 4, den: 4, offset: 0, grid: true });
+      A.newTrack('G', harm(48000, 2, () => ({ f: 220, amp: .2 })), 0);
+      const bars = () => [...document.querySelectorAll('.ticks .tick.bar')].map(t => ({ lbl: t.textContent, x: parseFloat(t.style.left) }));
+      const o = { beatSec: A.beatSec(), bars120: bars().slice(0, 3) };
+      o.laneBg = document.querySelector('.lane .area').style.backgroundImage.includes('repeating-linear-gradient');
+      A.setTempo({ bpm: 60 }); o.bars60 = bars().slice(0, 3);
+      A.setTempo({ bpm: 90, num: 3, den: 8 }); o.beat38 = A.beatSec(); o.bars38 = bars().slice(0, 2);
+      A.setTempo({ grid: false }); o.secondsRuler = document.querySelector('.ticks .tick').textContent;
+      return o;
+    });
+    assert.equal(r.beatSec, .5);
+    assert.deepEqual(r.bars120, [{ lbl: '1', x: 0 }, { lbl: '2', x: 120 }, { lbl: '3', x: 240 }]);
+    assert.ok(r.laneBg, 'lane grid lines');
+    assert.deepEqual(r.bars60.map(b => b.x), [0, 240, 480]);
+    assert.ok(Math.abs(r.beat38 - 60 / 90 * .5) < 1e-9, '3/8 beat length'); assert.ok(Math.abs(r.bars38[1].x - 3 * r.beat38 * 60) < .01);
+    assert.equal(r.secondsRuler, '0:00');
+  });
+
+  await check('snap: clip drags and loop regions land on beats; Shift bypasses snapping', async () => {
+    await page.evaluate(() => { const A = window.__app; A.S.tracks.length = 0; A.S.pps = 60; A.setTempo({ bpm: 120, num: 4, den: 4, offset: 0, grid: true, snap: true }); A.newTrack('S', harm(48000, 2, () => ({ f: 220, amp: .2 })), 0); });
+    const drag = async (dx, shift) => {
+      const box = await page.locator('.lane .area canvas').first().boundingBox();
+      await page.evaluate(() => { window.__app.S.tracks[0].offset = 0; });
+      await page.mouse.move(box.x + 30, box.y + 40); await page.mouse.down();
+      if (shift) await page.keyboard.down('Shift');
+      await page.mouse.move(box.x + 30 + dx / 2, box.y + 40, { steps: 4 }); await page.mouse.move(box.x + 30 + dx, box.y + 40, { steps: 4 });
+      await page.mouse.up(); if (shift) await page.keyboard.up('Shift');
+      return page.evaluate(() => window.__app.S.tracks[0].offset);
+    };
+    const snapped = await drag(95), free = await drag(95, true);
+    assert.ok(Math.abs(snapped - 1.5) < 1e-6, 'snapped to 1.5 s, got ' + snapped);
+    assert.ok(Math.abs(free - 95 / 60) < .06 && Math.abs(free - 1.5) > .02, 'free drag ~' + (95 / 60).toFixed(3) + ' s, got ' + free);
+    const o = await page.evaluate(() => { const A = window.__app; return [A.snapT(.74), A.snapT(.76), A.snapT(.76, { shiftKey: true })]; });
+    assert.deepEqual(o, [.5, 1, .76]);
+  });
+
+  await check('metronome clicks land exactly on the beat with the accent on beat 1', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app; A.S.tracks.length = 0; A.setTempo({ bpm: 240, num: 4, den: 4, offset: 0, click: true, grid: false });
+      A.newTrack('M', harm(48000, 4, () => ({ f: 220, amp: .1 })), 0); A.ensureCtx();
+      const log = [], orig = AudioContext.prototype.createOscillator;
+      AudioContext.prototype.createOscillator = function () { const o = orig.call(this); const st = o.start.bind(o); o.start = w => { log.push({ w, f: o.frequency.value }); st(w); }; return o; };
+      A.play(0); await new Promise(r => setTimeout(r, 1500));
+      AudioContext.prototype.createOscillator = orig; document.querySelector('#btnStop').click(); A.setTempo({ click: false });
+      return log;
+    });
+    assert.ok(r.length >= 5, 'got ' + r.length + ' clicks');
+    for (let i = 1; i < 5; i++) assert.ok(Math.abs(r[i].w - r[i - 1].w - .25) < .002, 'spacing ' + (r[i].w - r[i - 1].w));
+    assert.deepEqual(r.slice(0, 5).map(c => c.f), [1600, 1000, 1000, 1000, 1600]);
+  });
+
+  await check('count-in: clicks play for the chosen bars before the recording starts', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app; A.S.tracks.length = 0; A.setTempo({ bpm: 240, num: 4, den: 4, countIn: 1, click: false }); A.ensureCtx();
+      let clicks = 0; const orig = AudioContext.prototype.createOscillator;
+      AudioContext.prototype.createOscillator = function () { clicks++; return orig.call(this); };
+      const t0 = performance.now(); document.querySelector('#btnRec').click();
+      while (!A.S.recording && performance.now() - t0 < 8000) await new Promise(r => setTimeout(r, 20));
+      const waited = (performance.now() - t0) / 1000, started = !!A.S.recording;
+      await new Promise(r => setTimeout(r, 400)); AudioContext.prototype.createOscillator = orig;
+      document.querySelector('#btnRec').click();
+      for (let i = 0; i < 100 && !(A.S.tracks[0] && A.S.tracks[0].buffer); i++) await new Promise(r => setTimeout(r, 50));
+      A.setTempo({ countIn: 0 });
+      return { waited, started, countInClicks: clicks, gotAudio: !!(A.S.tracks[0] && A.S.tracks[0].buffer) };
+    });
+    assert.ok(r.started, 'recording started'); assert.ok(r.waited > .9 && r.waited < 2.5, 'waited ' + r.waited.toFixed(2) + ' s for a 1 s count-in');
+    assert.equal(r.countInClicks, 4); assert.ok(r.gotAudio, 'recorded audio decoded');
+  });
+
+  await check('tap tempo, project save/load and undo all carry the tempo settings', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app; A.S.tracks.length = 0; A.setTempo({ bpm: 120, num: 4, den: 4, grid: false, countIn: 0, offset: 0, click: false });
+      A.newTrack('T', harm(48000, 1, () => ({ f: 220, amp: .2 })), 0); A.resetHistory();
+      const o = {};
+      [0, 500, 1000, 1500, 2000].forEach(t => A.tapTempo(t)); o.tapped = A.S.tempo.bpm;
+      A.tapTempo(9000); A.tapTempo(9400); o.tappedFast = A.S.tempo.bpm;        // a >2 s gap starts a fresh tap series
+      A.setTempo({ bpm: 97.5, num: 3, den: 4, grid: true, offset: .25, countIn: 2 }); A.commitHistory();
+      const ab = await A.buildProjectBlob().arrayBuffer();
+      A.setTempo({ bpm: 140, num: 5, grid: false, offset: 0, countIn: 0 });
+      await A.loadProjectBuffer(ab); o.loaded = { ...A.S.tempo };
+      A.setTempo({ bpm: 111 }); A.commitHistory(); A.undo(); o.afterUndo = A.S.tempo.bpm; A.redo(); o.afterRedo = A.S.tempo.bpm;
+      A.setTempo({ bpm: 120, num: 4, den: 4, grid: false, countIn: 0, offset: 0, click: false });
+      return o;
+    });
+    assert.equal(r.tapped, 120); assert.equal(r.tappedFast, 150);
+    assert.deepEqual([r.loaded.bpm, r.loaded.num, r.loaded.den, r.loaded.grid, r.loaded.offset, r.loaded.countIn], [97.5, 3, 4, true, .25, 2]);
+    assert.equal(r.afterUndo, 97.5); assert.equal(r.afterRedo, 111);
   });
 
   await check('no errors were logged during the whole run', async () => {
