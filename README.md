@@ -35,8 +35,10 @@ then open <http://localhost:8000>.
 | **Vocal chain** | 3-band EQ with presence and air, split-band **de-esser**, compressor, warmth (saturation), delay and reverb. Presets for pop, rap, airy, warm, lo-fi and harsh voices. |
 | **Mastering** | Master EQ, glue compressor, limiter with a hard ceiling, loudness drive and presets. |
 | **Loudness** | Live peak meter, integrated LUFS analysis, and **Auto-level** to -14 / -16 / -11 / -9 LUFS. |
-| **Export** | 16-bit (dithered) or 24-bit WAV. |
-| **Projects** | Save and open `.vstudio` files containing your audio and every setting. |
+| **Spectrum** | Live log-frequency spectrum of the master output with peak hold and a marked sibilance zone. |
+| **Timeline** | Drag clips to reposition them, drag on the ruler to set a **loop region**, click the ruler to seek. |
+| **Export** | 16-bit (dithered) or 24-bit WAV of the mix, or **stems**: one WAV per track in a `.zip`, all the same length so they line up in any DAW. |
+| **Projects** | Save and open `.vstudio` files containing your audio and every setting. **Autosave** keeps a recovery copy in your browser every 10 seconds and offers to restore it if the tab was closed. |
 
 ## Using it
 
@@ -47,6 +49,8 @@ then open <http://localhost:8000>.
 5. **Export** the mix as WAV, and **Save project** (Ctrl+S) to come back to it later.
 
 Keyboard: `Space` play/pause, `Home` go to start, `Ctrl+S` save project.
+
+**Loop:** drag across the time ruler to select a region (looping turns on), then use the 🔁 Loop button to switch it on or off. **Move a take:** drag its waveform left or right. **Stems:** *Stems (.zip)* exports each track after its own effects but before the master chain, ready for another DAW or an engineer.
 
 ## Project files (`.vstudio`)
 
@@ -63,7 +67,7 @@ A single binary file: the magic string `VSTUDIO1`, a little-endian `uint32` leng
 
 - Auto-tune works best on a **dry, solo, monophonic** vocal. Heavy reverb, harmonies or backing music in the same track will confuse the pitch tracker. It is a practical corrector, not a replacement for commercial tools on extreme corrections.
 - The LUFS figure is an approximation; verify against a dedicated meter if a platform is strict.
-- No cloud saving, collaboration, sample library or mobile app, and no autosave — save with Ctrl+S before closing the tab.
+- No cloud saving, collaboration, sample library or mobile app. Autosave is a recovery copy in *this browser only* (it is lost if you clear site data or use a private window), so still save a `.vstudio` file with Ctrl+S for anything you care about.
 
 ## Development
 
@@ -75,7 +79,7 @@ npx playwright install chromium   # first time only
 npm test
 ```
 
-The tests in [`tests/app.test.js`](tests/app.test.js) load the page in headless Chromium and exercise the audio engine with synthetic signals: noise gate depth, auto-tune accuracy, loudness targeting, WAV output, project round-trips and the pitch graph. If your machine already has a Chromium binary, point `CHROMIUM_PATH` at it instead of installing one.
+The tests in [`tests/app.test.js`](tests/app.test.js) load the page in headless Chromium and exercise the audio engine with synthetic signals: noise gate depth, auto-tune accuracy, loudness targeting, WAV output, project round-trips, the pitch graph, stem ZIP validity, loop playback, clip dragging, autosave/restore and the spectrum analyzer. If your machine already has a Chromium binary, point `CHROMIUM_PATH` at it instead of installing one.
 
 ### Continuous integration
 

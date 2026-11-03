@@ -48,6 +48,12 @@ header{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 12px;b
 .head input[type=number]{width:62px;background:#0b0d11;border:1px solid var(--line);border-radius:4px;padding:1px 4px}
 .lane .area{position:relative;flex:none;background:repeating-linear-gradient(90deg,transparent 0 59px,#14171d 59px 60px);cursor:pointer}
 .lane .area canvas{position:absolute;top:0;height:96px;border-radius:4px;opacity:.95}
+#restoreBar{display:flex;gap:10px;align-items:center;padding:6px 12px;background:#2a2410;border-bottom:1px solid #5a4a14;color:#ffd77a}
+#restoreBar[hidden]{display:none}
+button.on{background:var(--accent2);border-color:var(--accent2);color:#04201b}
+#loopRegion{position:absolute;top:0;bottom:0;z-index:2;pointer-events:none;background:rgba(34,211,182,.07);border-left:2px solid #4b5563;border-right:2px solid #4b5563;display:none}
+#loopRegion.on{background:rgba(34,211,182,.13);border-color:var(--accent2)}
+.lane .area canvas{cursor:grab}
 #playhead{position:absolute;top:0;bottom:0;width:2px;background:var(--red);z-index:3;pointer-events:none}
 .empty{padding:50px 20px;color:var(--mute);text-align:center;position:sticky;left:0;max-width:700px;margin:auto}
 .empty b{color:var(--text)}
@@ -94,6 +100,7 @@ input[type=range]{accent-color:var(--accent)}
   <button id="btnStart" title="Go to start (Home)">⏮</button>
   <button id="btnPlay" class="primary" title="Play / pause (Space)">▶ Play</button>
   <button id="btnStop" title="Stop">■</button>
+  <button id="btnLoop" title="Loop playback — drag on the time ruler to set the loop region">🔁 Loop</button>
   <div id="time">0:00.000</div>
   <div class="sep"></div>
   <label class="hint">Zoom <input id="zoom" type="range" min="10" max="300" value="60" style="width:90px;vertical-align:middle"></label>
@@ -111,14 +118,17 @@ input[type=range]{accent-color:var(--accent)}
   <div class="sep"></div>
   <select id="bits"><option value="16">WAV 16-bit</option><option value="24" selected>WAV 24-bit</option></select>
   <button id="btnExport" class="primary">⬇ Export mix</button>
+  <button id="btnStems" title="One WAV per track (after track FX, before master) in a .zip">⬇ Stems (.zip)</button>
 </header>
 
+<div id="restoreBar" hidden><span id="restoreTxt"></span><button id="restoreYes" class="primary">Restore</button><button id="restoreNo">Discard</button></div>
 <div id="stage"><div id="inner"></div></div>
 
 <div id="bottom">
   <div class="tabs">
     <button class="tab on" data-tab="track">Track FX</button>
     <button class="tab" data-tab="pitch">Pitch graph</button>
+    <button class="tab" data-tab="spectrum">Spectrum</button>
     <button class="tab" data-tab="master">Master / Mastering</button>
     <span class="grow"></span>
     <span class="hint" id="panelHint"></span>
@@ -332,17 +342,20 @@ function makeMasterChain(c){
 const S = {
   tracks: [], master: defaults(MASTER_FX), selected: null, tab: 'track',
   playing: false, startCtx: 0, startPos: 0, pos: 0, pps: 60, nextId: 1, recording: null,
+  loop: {on: false, a: 0, b: 0}, unsaved: false, autoDirty: false, specView: null,
 };
-let ctx = null, live = null, sources = [];
+let ctx = null, live = null, sources = [], dragSuppress = false;
+function markDirty(){ S.unsaved = true; S.autoDirty = true; }
 
 function ensureCtx(){
   if (!ctx){
     ctx = new (window.AudioContext || window.webkitAudioContext)({latencyHint: 'interactive'});
     live = {chains: {}, master: makeMasterChain(ctx), analyser: ctx.createAnalyser()};
     live.analyser.fftSize = 2048;
+    live.spec = ctx.createAnalyser(); live.spec.fftSize = 8192; live.spec.smoothingTimeConstant = .8; live.spec.minDecibels = -100; live.spec.maxDecibels = 0;
     live.master.update(S.master, true);
     live.master.out.connect(ctx.destination);
-    live.master.out.connect(live.analyser);
+    live.master.out.connect(live.analyser); live.master.out.connect(live.spec);
     S.tracks.forEach(attachChain);
   }
   if (ctx.state === 'suspended') ctx.resume();
@@ -355,6 +368,7 @@ function attachChain(t){
 }
 function isActive(t){ const anySolo = S.tracks.some(x => x.solo); return !t.mute && (!anySolo || t.solo); }
 function refreshAll(imm){
+  if (!imm) markDirty();
   if (!ctx) return;
   S.tracks.forEach(t => live.chains[t.id] && live.chains[t.id].update(t, isActive(t), !!imm));
   live.master.update(S.master, !!imm);
@@ -362,7 +376,7 @@ function refreshAll(imm){
 function newTrack(name, buffer, offset){
   const t = {id: S.nextId++, name, buffer, orig: buffer, pitch: null, offset: offset || 0, vol: 0, pan: 0, mute: false, solo: false,
              fx: defaults(TRACK_FX), color: COLORS[(S.nextId - 2) % COLORS.length]};
-  S.tracks.push(t); S.selected = t.id;
+  S.tracks.push(t); S.selected = t.id; markDirty();
   if (ctx) attachChain(t);
   renderTracks(); renderPanel();
   return t;
@@ -496,6 +510,56 @@ function encodeWav(buf, bits){
     }
   }
   return new Blob([ab], {type: 'audio/wav'});
+}
+const CRC_T = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++){ let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(u8){ let c = 0xFFFFFFFF; for (let i = 0; i < u8.length; i++) c = CRC_T[(c ^ u8[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+function makeZip(files){   // store-only (no compression) ZIP — WAVs barely compress anyway
+  const enc = new TextEncoder(), parts = [], central = []; let off = 0;
+  const d = new Date(), dt = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate(), tm = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+  for (const f of files){
+    const name = enc.encode(f.name), crc = crc32(f.data), sz = f.data.length;
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true); lh.setUint16(10, tm, true); lh.setUint16(12, dt, true);
+    lh.setUint32(14, crc, true); lh.setUint32(18, sz, true); lh.setUint32(22, sz, true); lh.setUint16(26, name.length, true);
+    parts.push(new Uint8Array(lh.buffer), name, f.data);
+    const ch = new DataView(new ArrayBuffer(46));
+    ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint16(8, 0x0800, true); ch.setUint16(12, tm, true); ch.setUint16(14, dt, true);
+    ch.setUint32(16, crc, true); ch.setUint32(20, sz, true); ch.setUint32(24, sz, true); ch.setUint16(28, name.length, true); ch.setUint32(42, off, true);
+    central.push(new Uint8Array(ch.buffer), name); off += 30 + name.length + sz;
+  }
+  let cs = 0; central.forEach(c => cs += c.length);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true); end.setUint32(12, cs, true); end.setUint32(16, off, true);
+  return new Blob([...parts, ...central, new Uint8Array(end.buffer)], {type: 'application/zip'});
+}
+function saveBlob(blob, name){
+  const url = URL.createObjectURL(blob), a = el('a'); a.href = url; a.download = name; document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+function mixTail(){
+  let tail = .5;
+  S.tracks.forEach(t => { if (t.fx.rMix > 0) tail = Math.max(tail, t.fx.rSize + .2); if (t.fx.dMix > 0) tail = Math.max(tail, 2.5); });
+  return tail;
+}
+async function renderStem(t, len){      // one track through its own chain only (no master), regardless of mute/solo
+  const sr = ctx ? ctx.sampleRate : 48000, oc = new OfflineAudioContext(2, Math.ceil(len * sr), sr);
+  const chain = makeTrackChain(oc); chain.update(t, true, true); chain.out.connect(oc.destination);
+  const src = oc.createBufferSource(); src.buffer = t.buffer; src.connect(chain.in); scheduleSource(oc, src, t, 0, 0);
+  return oc.startRendering();
+}
+async function doStems(){
+  const ts = S.tracks.filter(t => t.buffer);
+  if (!ts.length) throw new Error('Nothing to export — add audio first.');
+  const len = projectDuration() + mixTail(), bits = +$('#bits').value, files = [], used = new Set();
+  for (let i = 0; i < ts.length; i++){
+    status('Rendering stem ' + (i + 1) + ' of ' + ts.length + '…');
+    const data = new Uint8Array(await encodeWav(await renderStem(ts[i], len), bits).arrayBuffer());
+    const base = (ts[i].name || 'track').replace(/[^\w\- ]+/g, '_').trim() || 'track'; let nm = base, k = 2;
+    while (used.has(nm.toLowerCase())) nm = base + '-' + k++;
+    used.add(nm.toLowerCase()); files.push({name: String(i + 1).padStart(2, '0') + ' - ' + nm + '.wav', data});
+  }
+  const zip = makeZip(files); saveBlob(zip, 'stems-' + new Date().toISOString().slice(0, 10) + '.zip');
+  status('Exported ' + files.length + ' stem' + (files.length === 1 ? '' : 's') + ' (' + bits + '-bit WAV, all the same length so they line up in any DAW) · ' + (zip.size / 1048576).toFixed(1) + ' MB.');
 }
 async function doAnalyze(){
   status('Rendering…'); const buf = await renderMix(); const m = await measure(buf);
@@ -678,7 +742,7 @@ function applyTune(buf, an, p){
 }
 
 function scheduleProcess(t, delay){
-  clearTimeout(t._pt);
+  markDirty(); clearTimeout(t._pt);
   t._pt = setTimeout(() => processTrack(t).catch(e => status('Processing failed: ' + e.message, true)), delay == null ? 250 : delay);
 }
 async function processTrack(t){
@@ -743,7 +807,37 @@ async function loadProjectBuffer(ab){
   S.selected = made.length ? made[Math.min(proj.selected || 0, made.length - 1)].id : null;
   refreshAll(true); renderTracks(); renderPanel();
   for (const t of made) if (t.fx.ngT > -80 || t.fx.atOn) await processTrack(t);
+  S.unsaved = false; S.autoDirty = false;
   return made.length;
+}
+const IDB = {
+  open(){ return new Promise((res, rej) => { const r = indexedDB.open('vocal-studio', 1); r.onupgradeneeded = () => r.result.createObjectStore('kv'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); },
+  async run(mode, fn){ const db = await this.open(); return new Promise((res, rej) => { const tx = db.transaction('kv', mode), rq = fn(tx.objectStore('kv')); tx.oncomplete = () => { db.close(); res(rq && rq.result); }; tx.onerror = () => { db.close(); rej(tx.error); }; }); },
+  put(k, v){ return this.run('readwrite', s => s.put(v, k)); },
+  get(k){ return this.run('readonly', s => s.get(k)); },
+  del(k){ return this.run('readwrite', s => s.delete(k)); },
+};
+let autosaving = false;
+async function autosave(){
+  if (autosaving || !S.autoDirty || S.recording || S.playing || !S.tracks.some(t => t.orig)) return;
+  autosaving = true;
+  try { S.autoDirty = false; await IDB.put('autosave', {blob: buildProjectBlob(), savedAt: Date.now(), tracks: S.tracks.length}); }
+  catch (e){ S.autoDirty = true; }
+  autosaving = false;
+}
+async function checkRestore(){
+  try {
+    const rec = await IDB.get('autosave'), bar = $('#restoreBar');
+    if (!rec || !rec.blob || S.tracks.length) return;
+    $('#restoreTxt').textContent = 'Recovered an unsaved session from ' + new Date(rec.savedAt).toLocaleString() + ' (' + rec.tracks + ' track' + (rec.tracks === 1 ? '' : 's') + ').';
+    bar.hidden = false;
+    $('#restoreYes').onclick = async () => {
+      bar.hidden = true;
+      try { await loadProjectBuffer(await rec.blob.arrayBuffer()); S.unsaved = true; status('Session restored.'); }
+      catch (e){ status('Could not restore: ' + e.message, true); }
+    };
+    $('#restoreNo').onclick = async () => { bar.hidden = true; try { await IDB.del('autosave'); } catch (e){} };
+  } catch (e){ /* IndexedDB unavailable (private mode etc.) — autosave is just skipped */ }
 }
 function saveProject(){
   if (S.recording) return status('Stop recording before saving.', true);
@@ -751,6 +845,7 @@ function saveProject(){
   const blob = buildProjectBlob(), url = URL.createObjectURL(blob);
   const a = el('a'); a.href = url; a.download = 'vocal-project-' + new Date().toISOString().slice(0, 10) + '.vstudio';
   document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
+  S.unsaved = false;
   status('Project saved (' + (blob.size / 1048576).toFixed(1) + ' MB). Open it later with “Open project”.');
 }
 async function openProjectFile(file){
@@ -869,6 +964,46 @@ function drawPitch(t, cv, ph, info){
 }
 window.addEventListener('resize', () => { if (S.tab === 'pitch') renderPanel(); });
 
+/* ---------- live spectrum analyzer (master output) ---------- */
+function renderSpectrumPanel(host, sel){
+  sel.style.display = 'none'; $('#panelHint').textContent = 'Master output · play to see it move';
+  const wrap = el('div', 'pitchwrap'), box = el('div', 'pitchbox'), cv = el('canvas');
+  box.style.cursor = 'default'; box.append(cv); wrap.append(box); host.append(wrap);
+  S.specView = {cv, hold: null, buf: null};
+}
+function drawSpectrum(){
+  const sv = S.specView; if (!sv || !sv.cv.isConnected) return;
+  const cv = sv.cv, W = cv.parentNode.clientWidth, H = cv.parentNode.clientHeight, dpr = window.devicePixelRatio || 1;
+  if (!W || !H) return;
+  if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)){ cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); cv.style.width = W + 'px'; cv.style.height = H + 'px'; }
+  const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.fillStyle = '#0b0d11'; g.fillRect(0, 0, W, H);
+  const L = 40, T = 6, PW = W - L - 10, PH = H - T - 18, FMIN = 20, FMAX = 20000, DB = 90;
+  const xOf = f => L + Math.log(f / FMIN) / Math.log(FMAX / FMIN) * PW, yOf = d => T + clamp(-d, 0, DB) / DB * PH;
+  g.font = '10px system-ui,sans-serif'; g.textBaseline = 'middle';
+  g.fillStyle = 'rgba(255,176,32,.06)'; g.fillRect(xOf(5000), T, xOf(8000) - xOf(5000), PH);       // typical sibilance zone
+  g.fillStyle = '#5b6275'; g.textAlign = 'left'; g.fillText('sibilance', xOf(5000) + 3, T + 8);
+  g.textAlign = 'right';
+  for (let d = 0; d >= -DB; d -= 15){ g.fillStyle = '#20242e'; g.fillRect(L, yOf(d), PW, 1); g.fillStyle = '#5b6275'; g.fillText(d + '', L - 5, yOf(d)); }
+  g.textAlign = 'center';
+  [[50,'50'],[100,'100'],[200,'200'],[500,'500'],[1000,'1k'],[2000,'2k'],[5000,'5k'],[10000,'10k']].forEach(([f, lb]) => { g.fillStyle = '#20242e'; g.fillRect(xOf(f), T, 1, PH); g.fillStyle = '#5b6275'; g.fillText(lb, xOf(f), H - 8); });
+  if (!live){ g.fillStyle = '#8b93a5'; g.fillText('Press play to start the analyzer.', L + PW / 2, T + PH / 2); return; }
+  const an = live.spec, n = an.frequencyBinCount, binHz = ctx.sampleRate / an.fftSize;
+  if (!sv.buf || sv.buf.length !== n) sv.buf = new Float32Array(n);
+  an.getFloatFrequencyData(sv.buf);
+  const px = Math.max(1, Math.floor(PW)); if (!sv.hold || sv.hold.length !== px) sv.hold = new Float32Array(px).fill(-120);
+  const line = new Float32Array(px);
+  for (let x = 0; x < px; x++){
+    const f0 = FMIN * Math.pow(FMAX / FMIN, x / px), f1 = FMIN * Math.pow(FMAX / FMIN, (x + 1) / px);
+    const i0 = Math.min(n - 1, Math.floor(f0 / binHz)), i1 = Math.min(n - 1, Math.max(i0, Math.floor(f1 / binHz)));
+    let m = -120; for (let i = i0; i <= i1; i++) if (sv.buf[i] > m) m = sv.buf[i];
+    line[x] = m; sv.hold[x] = Math.max(m, sv.hold[x] - .4);
+  }
+  const grad = g.createLinearGradient(0, T, 0, T + PH); grad.addColorStop(0, 'rgba(34,211,182,.55)'); grad.addColorStop(1, 'rgba(124,92,255,.05)');
+  g.beginPath(); g.moveTo(L, T + PH); for (let x = 0; x < px; x++) g.lineTo(L + x, yOf(line[x])); g.lineTo(L + px, T + PH); g.closePath(); g.fillStyle = grad; g.fill();
+  g.strokeStyle = '#22d3b6'; g.lineWidth = 1.2; g.beginPath(); for (let x = 0; x < px; x++){ const y = yOf(line[x]); x ? g.lineTo(L + x, y) : g.moveTo(L + x, y); } g.stroke();
+  g.strokeStyle = 'rgba(255,176,32,.7)'; g.lineWidth = 1; g.beginPath(); for (let x = 0; x < px; x++){ const y = yOf(sv.hold[x]); x ? g.lineTo(L + x, y) : g.moveTo(L + x, y); } g.stroke();
+}
+
 /* ---------- UI: tracks / lanes ---------- */
 function stageWidth(){ return Math.max(projectDuration() + 15, 40) * S.pps; }
 function renderTracks(){
@@ -880,7 +1015,17 @@ function renderTracks(){
   for (let s = 0; s * S.pps < W; s += every){
     const t = el('div', 'tick', Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0')); t.style.left = s * S.pps + 'px'; ticks.append(t);
   }
-  ticks.onclick = e => seek((e.clientX - ticks.getBoundingClientRect().left) / S.pps);
+  ticks.onpointerdown = e => {          // click = seek, drag = set loop region
+    const x0 = e.clientX, left = ticks.getBoundingClientRect().left, toT = x => Math.max(0, (x - left) / S.pps); let moved = false;
+    ticks.setPointerCapture(e.pointerId);
+    const mv = ev => { if (Math.abs(ev.clientX - x0) > 4){ moved = true; const a = toT(x0), b = toT(ev.clientX); S.loop.a = Math.min(a, b); S.loop.b = Math.max(a, b); updateLoopUI(); } };
+    const up = ev => {
+      ticks.removeEventListener('pointermove', mv); ticks.removeEventListener('pointerup', up);
+      if (!moved) return seek(toT(ev.clientX));
+      if (S.loop.b - S.loop.a > .05){ S.loop.on = true; updateLoopUI(); if (S.playing) play(S.loop.a); else seek(S.loop.a); }
+    };
+    ticks.addEventListener('pointermove', mv); ticks.addEventListener('pointerup', up);
+  };
   ruler.append(ticks); inner.append(ruler);
 
   if (!S.tracks.length){
@@ -904,22 +1049,47 @@ function renderTracks(){
     const vol = rangeEl(-30, 12, .1, t.vol, v => { t.vol = v; refreshAll(); }); vol.ondblclick = () => { vol.value = 0; vol.oninput(); };
     const pan = rangeEl(-1, 1, .01, t.pan, v => { t.pan = v; refreshAll(); }); pan.ondblclick = () => { pan.value = 0; pan.oninput(); };
     const off = el('input'); off.type = 'number'; off.step = 10; off.value = Math.round(t.offset * 1000);
-    off.onclick = e => e.stopPropagation(); off.onchange = () => { t.offset = (+off.value || 0) / 1000; if (S.playing) play(curPos()); renderTracks(); };
+    off.onclick = e => e.stopPropagation(); off.onchange = () => { markDirty(); t.offset = (+off.value || 0) / 1000; if (S.playing) play(curPos()); renderTracks(); };
     r2.append(el('span', null, 'Vol'), vol, el('span', null, 'Pan'), pan, el('span', null, 'ms'), off);
     head.append(r1, r2);
 
     const area = el('div', 'area'); area.style.width = W + 'px';
-    area.onclick = e => seek((e.clientX - area.getBoundingClientRect().left) / S.pps);
+    area.onclick = e => { if (!dragSuppress) seek((e.clientX - area.getBoundingClientRect().left) / S.pps); };
     if (t.buffer){
       const cv = el('canvas'); cv.width = Math.max(1, Math.min(30000, Math.floor(t.buffer.duration * S.pps))); cv.height = 96;
       cv.style.left = Math.max(0, t.offset) * S.pps + 'px'; cv.style.width = cv.width + 'px';
       drawWave(cv, t.buffer, t.color); area.append(cv);
+      cv.title = 'Drag to move this clip';
+      cv.onpointerdown = e => {
+        const x0 = e.clientX, o0 = t.offset; let moved = false; cv.setPointerCapture(e.pointerId); cv.style.cursor = 'grabbing';
+        const mv = ev => { const dx = ev.clientX - x0; if (Math.abs(dx) > 3) moved = true; if (moved){ t.offset = Math.max(0, o0 + dx / S.pps); cv.style.left = t.offset * S.pps + 'px'; } };
+        const up = () => {
+          cv.removeEventListener('pointermove', mv); cv.removeEventListener('pointerup', up); cv.style.cursor = 'grab';
+          if (!moved) return;
+          dragSuppress = true; setTimeout(() => dragSuppress = false, 0);
+          markDirty(); if (S.playing) play(curPos()); renderTracks();
+        };
+        cv.addEventListener('pointermove', mv); cv.addEventListener('pointerup', up);
+      };
     } else area.append(Object.assign(el('div', 'hint', '  recording…'), {style: 'padding:36px 12px'}));
     lane.append(head, area); inner.append(lane);
   });
+  const lr = el('div'); lr.id = 'loopRegion'; inner.append(lr);
   const ph = el('div'); ph.id = 'playhead'; inner.append(ph);
   inner.style.width = (230 + W) + 'px';
-  draw();
+  updateLoopUI(); draw();
+}
+function updateLoopUI(){
+  const lr = $('#loopRegion'), L = S.loop, ok = L.b - L.a > .05;
+  $('#btnLoop').classList.toggle('on', L.on);
+  if (!lr) return;
+  lr.style.display = ok ? 'block' : 'none'; lr.classList.toggle('on', L.on);
+  lr.style.left = (230 + L.a * S.pps) + 'px'; lr.style.width = Math.max(0, (L.b - L.a) * S.pps) + 'px';
+}
+function toggleLoop(){
+  const L = S.loop;
+  if (!L.on){ if (L.b - L.a < .05){ L.a = 0; L.b = Math.max(1, projectDuration()); } L.on = true; } else L.on = false;
+  updateLoopUI();
 }
 function rangeEl(min, max, step, val, fn){
   const r = el('input'); r.type = 'range'; r.min = min; r.max = max; r.step = step; r.value = val;
@@ -937,7 +1107,7 @@ function drawWave(cv, buf, color){
 }
 function removeTrack(t){
   if (S.recording && S.recording.track === t) return;
-  S.tracks = S.tracks.filter(x => x !== t);
+  S.tracks = S.tracks.filter(x => x !== t); markDirty();
   if (live && live.chains[t.id]){ live.chains[t.id].out.disconnect(); delete live.chains[t.id]; }
   if (S.selected === t.id) S.selected = S.tracks.length ? S.tracks[0].id : null;
   if (S.playing) play(curPos());
@@ -949,8 +1119,9 @@ function syncTabs(){ document.querySelectorAll('.tab').forEach(b => b.classList.
 function renderPanel(){
   const host = $('#fxhost'); host.innerHTML = '';
   const sel = $('#presetSel'); sel.innerHTML = '';
-  host.classList.toggle('pitch', S.tab === 'pitch'); S.pitchView = null;
+  host.classList.toggle('pitch', S.tab === 'pitch' || S.tab === 'spectrum'); S.pitchView = null; S.specView = null;
   if (S.tab === 'pitch') return renderPitchPanel(host, sel);
+  if (S.tab === 'spectrum') return renderSpectrumPanel(host, sel);
   const isTrack = S.tab === 'track', t = S.tracks.find(x => x.id === S.selected);
   const schema = isTrack ? TRACK_FX : MASTER_FX, obj = isTrack ? (t && t.fx) : S.master;
   const presets = isTrack ? TRACK_PRESETS : MASTER_PRESETS;
@@ -1011,7 +1182,8 @@ function draw(){
   if (S.playing){
     const stage = $('#stage'), x = 230 + pos * S.pps;
     if (x > stage.scrollLeft + stage.clientWidth - 40 || x < stage.scrollLeft + 230) stage.scrollLeft = Math.max(0, x - 260);
-    if (!S.recording && pos > projectDuration() + (S.tracks.some(t => t.fx.rMix || t.fx.dMix) ? 2.5 : .3)) stop();
+    if (S.loop.on && S.loop.b - S.loop.a > .05 && !S.recording){ if (pos >= S.loop.b) play(S.loop.a); }
+    else if (!S.recording && pos > projectDuration() + (S.tracks.some(t => t.fx.rMix || t.fx.dMix) ? 2.5 : .3)) stop();
   }
   if (live){
     const a = new Float32Array(live.analyser.fftSize); live.analyser.getFloatTimeDomainData(a);
@@ -1022,7 +1194,7 @@ function draw(){
     $('#meterTxt').textContent = (db < -59 ? '-∞' : db.toFixed(1)) + ' dBFS';
   }
 }
-(function loop(){ draw(); requestAnimationFrame(loop); })();
+(function loop(){ draw(); drawSpectrum(); requestAnimationFrame(loop); })();
 
 /* ---------- wiring ---------- */
 $('#btnSave').onclick = saveProject;
@@ -1033,11 +1205,13 @@ $('#file').onchange = e => { importFiles([...e.target.files]); e.target.value = 
 $('#btnRec').onclick = toggleRecord;
 $('#btnPlay').onclick = () => S.playing ? pause() : play(S.pos);
 $('#btnStop').onclick = stop;
+$('#btnLoop').onclick = toggleLoop;
 $('#btnStart').onclick = () => seek(0);
 $('#zoom').oninput = e => { S.pps = +e.target.value; renderTracks(); };
 $('#btnAnalyze').onclick = () => doAnalyze().catch(e => status(e.message, true));
 $('#btnAuto').onclick = () => doAuto().catch(e => status(e.message, true));
 $('#btnExport').onclick = () => doExport().catch(e => status(e.message, true));
+$('#btnStems').onclick = () => doStems().catch(e => status(e.message, true));
 document.querySelectorAll('.tab').forEach(b => b.onclick = () => { S.tab = b.dataset.tab; syncTabs(); renderPanel(); });
 document.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.code === 'KeyS'){ e.preventDefault(); saveProject(); return; }
@@ -1052,8 +1226,10 @@ document.addEventListener('drop', e => {
   if (proj) openProjectFile(proj); else importFiles(fs);
 });
 
+window.addEventListener('beforeunload', e => { if (S.unsaved && S.tracks.some(t => t.orig)){ e.preventDefault(); e.returnValue = ''; } });
+setInterval(autosave, 10000); checkRestore();
 renderTracks(); renderPanel();
-window.__app = {buildProjectBlob, loadProjectBuffer, S, newTrack, renderMix, measure, encodeWav, ensureCtx, doAuto, refreshAll, applyGate, analyzePitch, applyTune, processTrack};
+window.__app = {play, curPos, makeZip, crc32, renderStem, mixTail, autosave, IDB, markDirty, buildProjectBlob, loadProjectBuffer, S, newTrack, renderMix, measure, encodeWav, ensureCtx, doAuto, refreshAll, applyGate, analyzePitch, applyTune, processTrack};
 </script>
 </body>
 </html>

@@ -4,7 +4,11 @@ const assert = require('node:assert/strict');
 const path = require('node:path');
 const fs = require('node:fs');
 
-const URL = 'file://' + path.resolve(__dirname, '..', 'index.html');
+const http = require('node:http');
+const { spawnSync } = require('node:child_process');
+const INDEX = path.resolve(__dirname, '..', 'index.html');
+// Served over http://localhost so IndexedDB (autosave) behaves like it does for real users.
+const server = http.createServer((req, res) => { res.setHeader('content-type', 'text/html'); res.end(fs.readFileSync(INDEX)); });
 const OUT = path.resolve(__dirname, '..', 'test-output');
 fs.mkdirSync(OUT, { recursive: true });
 
@@ -21,11 +25,13 @@ async function check(name, fn) {
   page.on('pageerror', e => errors.push(e.message));
   page.on('console', m => { if (m.type() === 'error') errors.push(m.text()); });
   page.on('dialog', d => d.accept());
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  const URL = 'http://127.0.0.1:' + server.address().port + '/';
   await page.goto(URL);
   await page.evaluate(() => window.__app.ensureCtx());
 
-  // Shared synthetic-signal helpers inside the page.
-  await page.evaluate(() => {
+  // Shared synthetic-signal helpers; registered as an init script so they survive page reloads.
+  await page.addInitScript(() => {
     window.harm = (sr, secs, fn) => {          // harmonic "voice": fn(t) -> {f, amp}
       const n = Math.round(sr * secs), b = new AudioBuffer({ length: n, numberOfChannels: 1, sampleRate: sr }), d = b.getChannelData(0);
       let ph = 0;
@@ -39,6 +45,8 @@ async function check(name, fn) {
     window.rmsDb = (b, a, z) => { const x = b.getChannelData(0); let s = 0; for (let i = a; i < z; i++) s += x[i] * x[i]; return 20 * Math.log10(Math.sqrt(s / (z - a)) + 1e-9); };
     window.medianF0 = an => { const v = []; for (let f = 0; f < an.nF; f++) if (an.voiced[f]) v.push(an.f0[f]); v.sort((a, b) => a - b); return v[v.length >> 1]; };
   });
+
+  await page.reload(); await page.evaluate(() => window.__app.ensureCtx());
 
   await check('page loads without console or page errors', async () => {
     assert.deepEqual(errors, []);
@@ -130,10 +138,68 @@ async function check(name, fn) {
     assert.ok(px > 500, 'expected violet note blocks on the canvas, found ' + px + ' px');
   });
 
+  await check('stems: store-only ZIP with correct CRC, readable by a real unzip tool', async () => {
+    const b64 = await page.evaluate(async () => {
+      const A = window.__app; A.S.tracks.length = 0;
+      const t1 = A.newTrack('Lead vox', harm(48000, 1, () => ({ f: 220, amp: .2 })), 0), t2 = A.newTrack('Beat', harm(48000, 2, () => ({ f: 110, amp: .2 })), .5);
+      const len = A.S.tracks.reduce((m, t) => Math.max(m, t.offset + t.buffer.duration), 0) + A.mixTail();
+      const files = [];
+      for (const t of [t1, t2]) { const b = await A.renderStem(t, len); files.push({ name: t.name + '.wav', data: new Uint8Array(await A.encodeWav(b, 24).arrayBuffer()), n: b.length }); }
+      if (files[0].n !== files[1].n) throw new Error('stems differ in length');
+      const ab = await A.makeZip(files).arrayBuffer(), u = new Uint8Array(ab); let s = ''; for (let i = 0; i < u.length; i += 8192) s += String.fromCharCode(...u.subarray(i, i + 8192));
+      return btoa(s);
+    });
+    const crc = await page.evaluate(() => window.__app.crc32(new TextEncoder().encode('123456789')));
+    assert.equal(crc, 0xCBF43926, 'CRC-32 check value');
+    const f = path.join(OUT, 'stems.zip'); fs.writeFileSync(f, Buffer.from(b64, 'base64'));
+    const py = spawnSync('python3', ['-c', 'import zipfile,sys;z=zipfile.ZipFile(sys.argv[1]);print(z.testzip() or "OK");print("|".join(z.namelist()))', f], { encoding: 'utf8' });
+    assert.equal(py.status, 0, py.stderr);
+    const [ok, names] = py.stdout.trim().split('\n');
+    assert.equal(ok, 'OK'); assert.equal(names, 'Lead vox.wav|Beat.wav');
+  });
+
+  await check('loop region wraps playback back to its start', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app; A.S.loop.a = .3; A.S.loop.b = .8; A.S.loop.on = true; A.play(.3);
+      await new Promise(r => setTimeout(r, 1800));
+      const pos = A.curPos(), playing = A.S.playing; A.S.loop.on = false; A.S.playing && document.querySelector('#btnStop').click();
+      return { pos, playing };
+    });
+    assert.ok(r.playing, 'still playing'); assert.ok(r.pos < .95, 'position ' + r.pos.toFixed(2) + 's should stay inside the loop (would be ~2.1 s without it)');
+  });
+
+  await check('dragging a clip on the timeline moves its offset', async () => {
+    await page.evaluate(() => { const A = window.__app; A.S.tracks.length = 0; A.newTrack('Drag me', harm(48000, 2, () => ({ f: 220, amp: .2 })), 0); });
+    const box = await page.locator('.lane .area canvas').first().boundingBox();
+    await page.mouse.move(box.x + 40, box.y + 40); await page.mouse.down(); await page.mouse.move(box.x + 70, box.y + 40, { steps: 5 }); await page.mouse.move(box.x + 100, box.y + 40, { steps: 5 }); await page.mouse.up();
+    const off = await page.evaluate(() => window.__app.S.tracks[0].offset);
+    assert.ok(Math.abs(off - 1) < .08, 'offset ' + off + ' s (60 px at 60 px/s = 1 s)');
+  });
+
+  await check('autosave stores the session and offers to restore it after a reload', async () => {
+    await page.evaluate(async () => { const A = window.__app; A.markDirty(); await A.autosave(); });
+    const saved = await page.evaluate(async () => { const r = await window.__app.IDB.get('autosave'); return r && { tracks: r.tracks, size: r.blob.size }; });
+    assert.ok(saved && saved.tracks === 1 && saved.size > 1000, 'autosave record: ' + JSON.stringify(saved));
+    await page.reload(); await page.waitForSelector('#restoreBar:not([hidden])', { timeout: 5000 });
+    await page.click('#restoreYes');
+    await page.waitForFunction(() => window.__app.S.tracks.length === 1, null, { timeout: 10000 });
+    assert.equal(await page.evaluate(() => window.__app.S.tracks[0].name), 'Drag me');
+    await page.evaluate(() => window.__app.IDB.del('autosave'));
+  });
+
+  await check('spectrum analyzer draws the live master output', async () => {
+    await page.evaluate(() => { const A = window.__app; A.S.tracks.length = 0; A.newTrack('Tone', harm(48000, 3, () => ({ f: 440, amp: .3 })), 0); A.play(0); });
+    await page.click('[data-tab=spectrum]'); await page.waitForTimeout(900);
+    await page.screenshot({ path: path.join(OUT, 'spectrum.png') });
+    const px = await page.evaluate(() => { const c = document.querySelector('.pitchbox canvas'), d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; let n = 0; for (let i = 0; i < d.length; i += 4) if (d[i + 1] > 150 && d[i] < 80) n++; return n; });
+    await page.click('#btnStop');
+    assert.ok(px > 150, 'expected a teal spectrum trace, found ' + px + ' px');
+  });
+
   await check('no errors were logged during the whole run', async () => {
     assert.deepEqual(errors, []);
   });
 
-  await browser.close();
+  await browser.close(); server.close();
   console.log('\n' + passed + ' passed' + (process.exitCode ? ', some FAILED' : ''));
 })();
