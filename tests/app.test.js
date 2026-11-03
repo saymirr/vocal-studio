@@ -494,6 +494,76 @@ async function check(name, fn) {
     assert.equal(r.length, 2); assert.ok(Math.abs(r[0][2] - 2) < .05 && Math.abs(r[1][1] - 2) < .05, 'double-click split near 2 s: ' + JSON.stringify(r));
   });
 
+  await check('doubler: each voice has the right detune, level and stereo side; the lead is untouched', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app, sr = A.ensureCtx().sampleRate;
+      const dry = harm(sr, 3, () => ({ f: 220, amp: .15 })), d = dry.getChannelData(0);
+      const an = await A.analyzePitch(dry);
+      const p = { dbVoices: 1, dbLevel: -6, dbDetune: 10, dbDrift: 0, dbDelay: 20, dbSpread: 100, dbTone: 16000 };
+      const out = A.applyDoubler(dry, an, p), L = out.getChannelData(0), R = out.getChannelData(1), dly = Math.round(.02 * sr);
+      const mk = f => { const b = new AudioBuffer({ length: d.length, numberOfChannels: 1, sampleRate: sr }); f(b.getChannelData(0)); return b; };
+      const dl = mk(x => { for (let i = 0; i < d.length; i++) x[i] = L[i] - d[i]; }), dr = mk(x => { for (let i = 0; i < d.length; i++) x[i] = R[i] - d[i]; });
+      const rms = (b, a0, a1) => { const x = b.getChannelData(0); let s2 = 0; for (let i = a0; i < a1; i++) s2 += x[i] * x[i]; return Math.sqrt(s2 / (a1 - a0)); };
+      let preEq = true; for (let i = 0; i < dly; i++) if (L[i] !== d[i] || R[i] !== d[i]) preEq = false;
+      return { ch: out.numberOfChannels, len: out.length === dry.length, preEq, fL: medianF0(await A.analyzePitch(dl)), fR: medianF0(await A.analyzePitch(dr)),
+               gainL: rms(dl, sr, 2 * sr) / rms(dry, sr, 2 * sr), gainR: rms(dr, sr, 2 * sr) / rms(dry, sr, 2 * sr) };
+    });
+    assert.equal(r.ch, 2); assert.ok(r.len); assert.ok(r.preEq, 'nothing but the lead is audible before the first delay');
+    assert.ok(Math.abs(r.fL - 220 * Math.pow(2, -10 / 1200)) < .6, 'left voice ' + r.fL.toFixed(2) + ' Hz (want 218.7)');
+    assert.ok(Math.abs(r.fR - 220 * Math.pow(2, 10 / 1200)) < .6, 'right voice ' + r.fR.toFixed(2) + ' Hz (want 221.3)');
+    for (const g of [r.gainL, r.gainR]) assert.ok(Math.abs(g - Math.pow(10, -6 / 20)) < .06, 'voice level ' + g.toFixed(3) + ' (want 0.501)');
+  });
+
+  await check('doubler: time offsets are exact (22 ms and 1.25x), measured on noise', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app, sr = A.ensureCtx().sampleRate, n = sr, nz = new AudioBuffer({ length: n, numberOfChannels: 1, sampleRate: sr }), d = nz.getChannelData(0);
+      for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * .2;
+      const an = await A.analyzePitch(nz), out = A.applyDoubler(nz, an, { dbVoices: 1, dbLevel: 0, dbDetune: 0, dbDrift: 0, dbDelay: 22, dbSpread: 100, dbTone: 16000 });
+      const lag = ch => { const x = out.getChannelData(ch), y = new Float32Array(n); for (let i = 0; i < n; i++) y[i] = x[i] - d[i]; let best = 0, bl = 0;
+        for (let k = 0; k < 2000; k++) { let s2 = 0; for (let i = 3000; i < 23000; i++) s2 += d[i] * y[i + k]; if (s2 > best) { best = s2; bl = k; } } return bl; };
+      return { L: lag(0), R: lag(1), want: [Math.round(.022 * sr), Math.round(.022 * sr * 1.25)], voiced: an.voicedPct };
+    });
+    assert.ok(r.voiced < .05, 'noise should be unvoiced (' + r.voiced + ')');
+    assert.ok(Math.abs(r.L - r.want[0]) <= 3, 'left lag ' + r.L + ' want ~' + r.want[0]); assert.ok(Math.abs(r.R - r.want[1]) <= 3, 'right lag ' + r.R + ' want ~' + r.want[1]);
+  });
+
+  await check('doubler follows the tuned vocal and caches its analysis until tune settings change', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app, sr = A.ensureCtx().sampleRate; A.S.tracks.length = 0;
+      const t = A.newTrack('Tuned dbl', harm(sr, 3, () => ({ f: 226, amp: .15 })), 0);
+      Object.assign(t.fx, { atOn: 1, atKey: 9, atScale: 0, atSpeed: 0, atAmt: 100, dbOn: 1, dbVoices: 0, dbLevel: -3, dbDetune: 10, dbDrift: 0, dbDelay: 20, dbSpread: 100, dbTone: 16000 });
+      await A.processTrack(t);
+      const L = t.buffer.getChannelData(0), R = t.buffer.getChannelData(1), v = new AudioBuffer({ length: L.length, numberOfChannels: 1, sampleRate: sr });
+      const x = v.getChannelData(0); for (let i = 0; i < L.length; i++) x[i] = R[i] - L[i];          // single right voice: L is the lead, R - L the double
+      const o = { ch: t.buffer.numberOfChannels, f: medianF0(await A.analyzePitch(v)), first: t.dblPitch };
+      t.fx.dbDetune = 15; await A.processTrack(t); o.sameAfterDetune = t.dblPitch === o.first;
+      t.fx.atKey = 0; await A.processTrack(t); o.newAfterTune = t.dblPitch !== o.first; delete o.first; return o;
+    });
+    assert.equal(r.ch, 2); assert.ok(Math.abs(r.f - 220 * Math.pow(2, 10 / 1200)) < .8, 'double at ' + r.f.toFixed(2) + ' Hz (tuned A3 + 10 cents = 221.3; untuned would be ~227.3)');
+    assert.ok(r.sameAfterDetune, 'changing detune must reuse the cached analysis'); assert.ok(r.newAfterTune, 'changing the tune settings must re-analyze');
+  });
+
+  await check('doubler is repeatable, runs through the pipeline, and survives undo/redo, save/load and split', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app, sr = A.ensureCtx().sampleRate; A.S.tracks.length = 0; A.S.master.drive = 0; A.resetHistory();
+      const t = A.newTrack('Pipe', harm(sr, 2, () => ({ f: 220, amp: .15 })), 0); A.commitHistory();
+      const until = async f => { for (let i = 0; i < 200 && !f(); i++) await new Promise(r => setTimeout(r, 50)); return f(); };
+      const an = await A.analyzePitch(t.orig), p = { dbVoices: 1, dbLevel: -6, dbDetune: 10, dbDrift: 8, dbDelay: 22, dbSpread: 80, dbTone: 9000 };
+      const a = A.applyDoubler(t.orig, an, p), b = A.applyDoubler(t.orig, an, p); let identical = true;
+      for (let c = 0; c < 2; c++) { const x = a.getChannelData(c), y = b.getChannelData(c); for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) { identical = false; break; } }
+      const o = { identical }; Object.assign(t.fx, { dbOn: 1, dbDrift: 8 }); A.markDirty(); await A.processTrack(t); A.commitHistory();
+      o.stereo = t.buffer.numberOfChannels === 2; o.origMono = t.orig.numberOfChannels === 1;
+      A.undo(); o.undone = await until(() => t.buffer === t.orig && !t.fx.dbOn);
+      A.redo(); o.redone = await until(() => t.buffer !== t.orig && t.buffer.numberOfChannels === 2 && t.fx.dbOn === 1);
+      const ab = await A.buildProjectBlob().arrayBuffer(); A.S.tracks.length = 0; await A.loadProjectBuffer(ab);
+      const u = A.S.tracks[0]; o.loaded = [u.fx.dbOn, u.fx.dbDrift, u.buffer.numberOfChannels, u.orig.numberOfChannels];
+      A.splitTrack(u, 1); o.halves = await until(() => A.S.tracks.length === 2 && A.S.tracks.every(x => x.buffer !== x.orig && x.buffer.numberOfChannels === 2));
+      u.fx.dbOn = 0; A.markDirty(); await A.processTrack(u); o.off = u.buffer === u.orig; return o;
+    });
+    assert.ok(r.identical, 'same settings must give identical audio'); assert.ok(r.stereo && r.origMono, 'the doubled clip is stereo; the source stays untouched');
+    assert.ok(r.undone && r.redone, 'undo / redo'); assert.deepEqual(r.loaded, [1, 8, 2, 1]); assert.ok(r.halves, 'both halves of a split doubled clip are doubled'); assert.ok(r.off, 'disabling restores the original clip');
+  });
+
   await check('no errors were logged during the whole run', async () => {
     assert.deepEqual(errors, []);
   });
