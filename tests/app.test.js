@@ -353,6 +353,68 @@ async function check(name, fn) {
     assert.equal(r.afterUndo, 97.5); assert.equal(r.afterRedo, 111);
   });
 
+  await check('fades: exact gain at the edges and midpoints for linear, equal-power and S-curve', async () => {
+    const r = await page.evaluate(() => {
+      const A = window.__app, sr = 48000, N = sr, buf = new AudioBuffer({ length: N, numberOfChannels: 2, sampleRate: sr });
+      for (let c = 0; c < 2; c++) buf.getChannelData(c).fill(1);
+      const run = curve => { const o = A.applyFades(buf, { fadeIn: .1, fadeOut: .2, fadeCurve: curve }), d = o.getChannelData(1);
+        return { first: d[0], last: d[N - 1], inMid: d[2400], outMid: d[N - 1 - 4800], mid: d[N >> 1], len: o.length, ch: o.numberOfChannels }; };
+      return { lin: run(0), eq: run(1), s: run(2), srcUntouched: buf.getChannelData(0)[0] === 1 && buf.getChannelData(0)[100] === 1 };
+    });
+    for (const k of ['lin', 'eq', 's']) { assert.equal(r[k].first, 0, k + ' starts silent'); assert.equal(r[k].last, 0, k + ' ends silent'); assert.equal(r[k].mid, 1, k + ' untouched in the middle'); assert.equal(r[k].len, 48000); assert.equal(r[k].ch, 2); }
+    assert.ok(Math.abs(r.lin.inMid - .5) < 1e-6 && Math.abs(r.lin.outMid - .5) < 1e-6, 'linear half-way = 0.5');
+    assert.ok(Math.abs(r.eq.inMid - Math.SQRT1_2) < 1e-6, 'equal power half-way = 0.7071');
+    assert.ok(Math.abs(r.s.inMid - .5) < 1e-6, 'S-curve half-way = 0.5');
+    assert.ok(r.srcUntouched, 'source buffer must not be modified');
+  });
+
+  await check('fades run through the track pipeline: applied, removed, and undone / redone', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app; A.S.tracks.length = 0; A.S.tempo.grid = false; A.resetHistory();
+      const sr = 48000, b = new AudioBuffer({ length: sr * 2, numberOfChannels: 1, sampleRate: sr }); b.getChannelData(0).fill(.5);
+      const t = A.newTrack('Fade', b, 0); A.commitHistory();
+      const until = async f => { for (let i = 0; i < 60 && !f(); i++) await new Promise(r => setTimeout(r, 50)); return f(); };
+      Object.assign(t.fx, { fadeIn: 1, fadeOut: .5, fadeCurve: 0 }); A.markDirty(); await A.processTrack(t); A.commitHistory();
+      const d = t.buffer.getChannelData(0), o = { applied: t.buffer !== t.orig, first: d[0], quarter: d[sr >> 1], mid: d[sr * 1.2 | 0], last: d[d.length - 1], origIntact: t.orig.getChannelData(0)[0] === .5 };
+      A.undo(); o.undone = await until(() => t.buffer === t.orig && t.fx.fadeIn === 0);
+      A.redo(); o.redone = await until(() => t.buffer !== t.orig && t.fx.fadeIn === 1);
+      t.fx.fadeIn = 0; t.fx.fadeOut = 0; A.markDirty(); await A.processTrack(t); o.removed = t.buffer === t.orig;
+      return o;
+    });
+    assert.ok(r.applied); assert.equal(r.first, 0); assert.ok(Math.abs(r.quarter - .25) < 1e-6, 'quarter ' + r.quarter); assert.equal(r.mid, .5); assert.equal(r.last, 0); assert.ok(r.origIntact);
+    assert.deepEqual([r.undone, r.redone, r.removed], [true, true, true]);
+  });
+
+  await check('dragging the fade handles on a clip sets the fade length', async () => {
+    await page.evaluate(() => {
+      const A = window.__app; A.S.tracks.length = 0; A.S.pps = 60; A.setTempo({ grid: false });
+      const b = new AudioBuffer({ length: 96000, numberOfChannels: 1, sampleRate: 48000 }); b.getChannelData(0).fill(.5); A.newTrack('H', b, 0);
+    });
+    const drag = async (sel, dx) => {
+      const bx = await page.locator(sel).first().boundingBox(), x = bx.x + bx.width / 2, y = bx.y + bx.height / 2;
+      await page.mouse.move(x, y); await page.mouse.down(); await page.mouse.move(x + dx / 2, y, { steps: 4 }); await page.mouse.move(x + dx, y, { steps: 4 }); await page.mouse.up();
+    };
+    await drag('.fadehd >> nth=0', 60);                          // fade-in handle: +60 px at 60 px/s = 1 s
+    await page.waitForFunction(() => window.__app.S.tracks[0].buffer !== window.__app.S.tracks[0].orig, null, { timeout: 5000 });
+    await drag('.fadehd >> nth=1', -30);                         // fade-out handle: -30 px = 0.5 s
+    await page.waitForFunction(() => { const t = window.__app.S.tracks[0]; return t.buffer.getChannelData(0)[t.buffer.length - 2] < .01 && t.fx.fadeOut > .4; }, null, { timeout: 5000 });
+    const r = await page.evaluate(() => { const t = window.__app.S.tracks[0], d = t.buffer.getChannelData(0); return { fi: t.fx.fadeIn, fo: t.fx.fadeOut, atHalf: d[24000], first: d[0], sliders: document.querySelector('.fxhost') ? true : false }; });
+    assert.ok(Math.abs(r.fi - 1) < .05, 'fade in ' + r.fi); assert.ok(Math.abs(r.fo - .5) < .05, 'fade out ' + r.fo);
+    assert.equal(r.first, 0); assert.ok(Math.abs(r.atHalf - .5 * Math.SQRT1_2) < .02, 'equal-power at half of a 1 s fade-in: ' + r.atHalf);
+  });
+
+  await check('fades survive project save / load and are re-applied', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app; A.S.tracks.length = 0;
+      const b = new AudioBuffer({ length: 48000, numberOfChannels: 1, sampleRate: 48000 }); b.getChannelData(0).fill(.5);
+      const t = A.newTrack('Persist', b, 0); Object.assign(t.fx, { fadeIn: .25, fadeOut: .25, fadeCurve: 2 }); A.markDirty(); await A.processTrack(t);
+      const ab = await A.buildProjectBlob().arrayBuffer(); A.S.tracks.length = 0;
+      await A.loadProjectBuffer(ab); const u = A.S.tracks[0], d = u.buffer.getChannelData(0);
+      return { fx: [u.fx.fadeIn, u.fx.fadeOut, u.fx.fadeCurve], faded: u.buffer !== u.orig, first: d[0], last: d[d.length - 1], origDry: u.orig.getChannelData(0)[0] };
+    });
+    assert.deepEqual(r.fx, [.25, .25, 2]); assert.ok(r.faded); assert.equal(r.first, 0); assert.equal(r.last, 0); assert.equal(r.origDry, .5, 'the saved audio stays unfaded');
+  });
+
   await check('no errors were logged during the whole run', async () => {
     assert.deepEqual(errors, []);
   });

@@ -38,6 +38,7 @@ then open <http://localhost:8000>.
 | **Spectrum** | Live log-frequency spectrum of the master output with peak hold and a marked sibilance zone. |
 | **Undo / redo** | Up to 80 steps for every setting, mute/solo, clip move, rename, add/delete track and the whole master chain. A slider drag counts as one step, a deleted track comes back with its audio, and gate/auto-tune are re-applied automatically. `Ctrl+Z` / `Ctrl+Shift+Z` (or `Ctrl+Y`). |
 | **Metronome & grid** | Set the BPM (or **tap it in**) and time signature (1–16 over 4 or 8). A sample-accurate **click** with an accented downbeat plays with the transport, with an optional **1–2 bar count-in before recording**. A bar/beat **grid** appears on the ruler and lanes, and clip drags and loop regions **snap to beats** (hold Shift for free movement). A grid offset lines bar 1 up with an imported beat. Click and grid are monitoring aids and are never included in exports. Tempo settings are saved in projects and covered by undo. |
+| **Fades** | Per-track **fade in / fade out** (up to 10 s) with linear, equal-power or S-curve shapes. Set them with the sliders in *Track FX → Fades* or by **dragging the white handles** at the top corners of a clip (they snap to the grid when it is on, Shift = free). Fades are applied before the effects chain (so reverb and delay tails ring out naturally) and are identical in playback, mix export and stems. They are saved in projects and covered by undo. |
 | **Timeline** | Drag clips to reposition them, drag on the ruler to set a **loop region**, click the ruler to seek. |
 | **Export** | 16-bit (dithered) or 24-bit WAV of the mix, or **stems**: one WAV per track in a `.zip`, all the same length so they line up in any DAW. |
 | **Projects** | Save and open `.vstudio` files containing your audio and every setting. **Autosave** keeps a recovery copy in your browser every 10 seconds and offers to restore it if the tab was closed. |
@@ -81,7 +82,7 @@ npx playwright install chromium   # first time only
 npm test
 ```
 
-The tests in [`tests/app.test.js`](tests/app.test.js) load the page in headless Chromium and exercise the audio engine with synthetic signals: noise gate depth, auto-tune accuracy, loudness targeting, WAV output, project round-trips, the pitch graph, stem ZIP validity, loop playback, clip dragging, autosave/restore, the spectrum analyzer, undo/redo, and the tempo grid, metronome scheduling, snapping and count-in. If your machine already has a Chromium binary, point `CHROMIUM_PATH` at it instead of installing one.
+The tests in [`tests/app.test.js`](tests/app.test.js) load the page in headless Chromium and exercise the audio engine with synthetic signals: noise gate depth, auto-tune accuracy, loudness targeting, WAV output, project round-trips, the pitch graph, stem ZIP validity, loop playback, clip dragging, autosave/restore, the spectrum analyzer, undo/redo, the tempo grid, metronome scheduling, snapping and count-in, and fade math, handles and persistence. If your machine already has a Chromium binary, point `CHROMIUM_PATH` at it instead of installing one.
 
 ### Continuous integration
 

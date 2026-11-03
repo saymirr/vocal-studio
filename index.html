@@ -53,6 +53,9 @@ header{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 12px;b
 #restoreBar{display:flex;gap:10px;align-items:center;padding:6px 12px;background:#2a2410;border-bottom:1px solid #5a4a14;color:#ffd77a}
 #restoreBar[hidden]{display:none}
 button:disabled{opacity:.4;cursor:default;border-color:var(--line)}
+.fadeov{position:absolute;top:0;height:96px;background:rgba(255,255,255,.12);pointer-events:none;z-index:1}
+.fadehd{position:absolute;top:3px;width:11px;height:11px;border-radius:3px;background:#fff;border:2px solid var(--c);cursor:ew-resize;z-index:2;opacity:.9;touch-action:none}
+.fadehd:hover{opacity:1;transform:scale(1.2)}
 button.on{background:var(--accent2);border-color:var(--accent2);color:#04201b}
 #loopRegion{position:absolute;top:0;bottom:0;z-index:2;pointer-events:none;background:rgba(34,211,182,.07);border-left:2px solid #4b5563;border-right:2px solid #4b5563;display:none}
 #loopRegion.on{background:rgba(34,211,182,.13);border-color:var(--accent2)}
@@ -82,7 +85,7 @@ button.on{background:var(--accent2);border-color:var(--accent2);color:#04201b}
 .sl .v{text-align:right;font:11px ui-monospace,monospace}
 .sl input,.sl select{width:100%}
 .sl input[type=checkbox]{width:18px;height:18px;justify-self:start}
-.sl select{padding:2px 6px}
+.sl select{padding:2px 2px;font-size:12px;text-overflow:ellipsis;min-width:0}
 .sl input[type=number]{background:#0b0d11;border:1px solid var(--line);border-radius:4px;padding:3px 6px;width:100%}
 #status{padding:4px 12px;font-size:12px;color:var(--mute);background:#0b0d11;border-top:1px solid var(--line);min-height:24px}
 #status.err{color:var(--red)}
@@ -181,6 +184,10 @@ const TRACK_FX = [
   {k:'ngA',  label:'Attack',         min:1,   max:50,   step:1,   def:3,    u:'ms', proc:1},
   {k:'ngH',  label:'Hold',           min:0,   max:500,  step:5,   def:80,   u:'ms', proc:1},
   {k:'ngR',  label:'Release',        min:10,  max:800,  step:5,   def:150,  u:'ms', proc:1},
+  {sec:'Fades (clip start / end)'},
+  {k:'fadeIn',  label:'Fade in',    min:0, max:10, step:.01, def:0, u:'s', note:'Also draggable on the clip', proc:1},
+  {k:'fadeOut', label:'Fade out',   min:0, max:10, step:.01, def:0, u:'s', note:'Also draggable on the clip', proc:1},
+  {k:'fadeCurve',type:'select', label:'Fade curve', options:['Linear','Eq. power','S-curve'], def:1, proc:1},
   {sec:'Auto-tune (pitch correction)'},
   {k:'atOn', type:'toggle', label:'Enable',  def:0, proc:1},
   {k:'atKey',type:'select', label:'Key',     options:KEYS, def:0, proc:1},
@@ -647,6 +654,19 @@ function applyGate(buf, p){
   return out;
 }
 
+// Fades: applied last in the pipeline, so they show in the waveform and are identical in playback, mix export and stems.
+const FADE_CURVES = [x => x, x => Math.sin(x * Math.PI / 2), x => x * x * (3 - 2 * x)];      // linear / equal power / S-curve
+function applyFades(buf, p){
+  const sr = buf.sampleRate, N = buf.length, fi = Math.min(N, Math.round(p.fadeIn * sr)), fo = Math.min(N, Math.round(p.fadeOut * sr));
+  const g = FADE_CURVES[p.fadeCurve] || FADE_CURVES[0], out = newBuf(buf);
+  for (let c = 0; c < buf.numberOfChannels; c++){
+    const o = out.getChannelData(c); o.set(buf.getChannelData(c));
+    for (let i = 0; i < fi; i++) o[i] *= g(i / fi);                  // 0 at the first sample, up to ~1
+    for (let i = 0; i < fo; i++) o[N - 1 - i] *= g(i / fo);          // 0 at the last sample
+  }
+  return out;
+}
+
 // Pitch tracking: YIN on a ~12 kHz decimated mono mix, then glottal-pulse marks for PSOLA.
 async function analyzePitch(buf, onProgress){
   const sr = buf.sampleRate, N = buf.length, nch = buf.numberOfChannels;
@@ -786,6 +806,7 @@ async function processTrack(t){
     if (t.pitch.voicedPct < .05) status('Auto-tune: very little pitched audio detected — works best on a dry, solo vocal.', true);
   }
   if (id !== t._proc) return;
+  if (p.fadeIn > 0 || p.fadeOut > 0){ b = applyFades(b, p); msg.push('fades'); }
   t.buffer = b; t.procSig = procSig(p);
   if (S.playing) play(curPos());
   renderTracks();
@@ -873,7 +894,7 @@ function renderTempoPanel(host, sel){
    History = snapshots of the project *state* (track list, every track's settings, master settings). Audio buffers are
    immutable so snapshots only hold references. Gate / auto-tune output is re-derived on restore via procSig. */
 const H = {stack: [], idx: -1, timer: null, restoring: false};
-const procSig = fx => JSON.stringify([fx.ngT > -80 ? [fx.ngT, fx.ngRange, fx.ngA, fx.ngH, fx.ngR] : 0, fx.atOn ? [fx.atKey, fx.atScale, fx.atSpeed, fx.atAmt] : 0]);
+const procSig = fx => JSON.stringify([fx.ngT > -80 ? [fx.ngT, fx.ngRange, fx.ngA, fx.ngH, fx.ngR] : 0, fx.atOn ? [fx.atKey, fx.atScale, fx.atSpeed, fx.atAmt] : 0, fx.fadeIn > 0 || fx.fadeOut > 0 ? [fx.fadeIn, fx.fadeOut, fx.fadeCurve] : 0]);
 function snapshot(){
   const sn = {tracks: S.tracks.map(t => ({id: t.id, name: t.name, color: t.color, offset: t.offset, vol: t.vol, pan: t.pan, mute: t.mute, solo: t.solo, fx: {...t.fx}, orig: t.orig, pitch: t.pitch})),
               master: {...S.master}, tempo: {...S.tempo}, selected: S.selected};
@@ -984,7 +1005,7 @@ async function loadProjectBuffer(ab){
   }
   S.selected = made.length ? made[Math.min(proj.selected || 0, made.length - 1)].id : null;
   refreshAll(true); renderTracks(); renderPanel();
-  for (const t of made) if (t.fx.ngT > -80 || t.fx.atOn) await processTrack(t);
+  for (const t of made) if (t.procSig !== procSig(t.fx)) await processTrack(t);
   S.unsaved = false; S.autoDirty = false; resetHistory();
   return made.length;
 }
@@ -1248,6 +1269,33 @@ function renderTracks(){
       cv.style.left = Math.max(0, t.offset) * S.pps + 'px'; cv.style.width = cv.width + 'px';
       drawWave(cv, t.buffer, t.color); area.append(cv);
       cv.title = 'Drag to move this clip';
+      const dur = t.buffer.duration, clipX = Math.max(0, t.offset) * S.pps;
+      ['in', 'out'].forEach(side => {
+        const key = side === 'in' ? 'fadeIn' : 'fadeOut', ov = el('div', 'fadeov'), hd = el('div', 'fadehd');
+        const pts = Array.from({length: 11}, (_, i) => { const x = i / 10, g = FADE_CURVES[t.fx.fadeCurve] || FADE_CURVES[0]; return (x * 100) + '% ' + ((1 - g(side === 'in' ? x : 1 - x)) * 100) + '%'; });
+        ov.style.clipPath = 'polygon(' + pts.join(',') + (side === 'in' ? ',0 0)' : ',100% 0)'); // the "lost" area above the fade curve
+        hd.title = 'Drag to set the fade ' + side + (S.tempo.grid && S.tempo.snap ? ' (snaps to the grid, Shift = free)' : '');
+        const place = len => {
+          const px = len * S.pps; ov.style.width = px + 'px'; ov.style.display = px > .5 ? 'block' : 'none';
+          ov.style.left = (side === 'in' ? clipX : clipX + dur * S.pps - px) + 'px';
+          hd.style.left = (side === 'in' ? Math.max(clipX, clipX + px - 6) : clipX + dur * S.pps - px - 6) + 'px';   // keep the in-handle clear of the sticky track header
+        };
+        place(Math.min(t.fx[key], dur)); area.append(ov, hd);
+        hd.onpointerdown = e => {
+          e.stopPropagation(); hd.setPointerCapture(e.pointerId); const x0 = e.clientX, L0 = Math.min(t.fx[key], dur);   // relative to where the handle was grabbed
+          const mv = ev => {
+            const dt = (ev.clientX - x0) / S.pps, edge = side === 'in' ? t.offset + L0 + dt : t.offset + dur - L0 + dt;
+            const tl = snapT(edge, ev), len = side === 'in' ? tl - t.offset : t.offset + dur - tl;
+            t.fx[key] = Math.round(clamp(len, 0, Math.min(dur, 10)) * 100) / 100; place(t.fx[key]);
+          };
+          const up = () => {
+            hd.removeEventListener('pointermove', mv); hd.removeEventListener('pointerup', up);
+            dragSuppress = true; setTimeout(() => dragSuppress = false, 0);
+            scheduleProcess(t, 0); if (S.tab === 'track' && S.selected === t.id) renderPanel();
+          };
+          hd.addEventListener('pointermove', mv); hd.addEventListener('pointerup', up);
+        };
+      });
       cv.onpointerdown = e => {
         const x0 = e.clientX, o0 = t.offset; let moved = false; cv.setPointerCapture(e.pointerId); cv.style.cursor = 'grabbing';
         const mv = ev => { const dx = ev.clientX - x0; if (Math.abs(dx) > 3) moved = true; if (moved){ t.offset = snapT(Math.max(0, o0 + dx / S.pps), ev); cv.style.left = t.offset * S.pps + 'px'; } };
@@ -1348,7 +1396,7 @@ function renderPanel(){
       row.append(s, el('span', 'v', '')); sec.append(row); return;
     }
     const r = el('input'); r.type = 'range'; r.min = d.min; r.max = d.max; r.step = d.step; r.value = obj[d.k];
-    const v = el('span', 'v'); const show = () => v.textContent = (+r.value).toFixed(d.step < 1 ? 1 : 0) + ' ' + d.u;
+    const v = el('span', 'v'); const show = () => v.textContent = (+r.value).toFixed(d.step < .1 ? 2 : d.step < 1 ? 1 : 0) + ' ' + d.u;
     r.oninput = () => { obj[d.k] = +r.value; show(); if (!d.proc) refreshAll(); };
     r.onchange = () => proc(d);                 // heavy processors run on release, not while dragging
     row.ondblclick = () => { r.value = d.def; r.oninput(); r.onchange(); };
@@ -1427,7 +1475,7 @@ document.addEventListener('drop', e => {
 window.addEventListener('beforeunload', e => { if (S.unsaved && S.tracks.some(t => t.orig)){ e.preventDefault(); e.returnValue = ''; } });
 setInterval(autosave, 10000); setInterval(metroTick, 25); updateTempoUI(); checkRestore(); resetHistory();
 renderTracks(); renderPanel();
-window.__app = {setTempo, tapTempo, beatSec, snapT, clickAt, H, undo, redo, commitHistory, resetHistory, play, curPos, makeZip, crc32, renderStem, mixTail, autosave, IDB, markDirty, buildProjectBlob, loadProjectBuffer, S, newTrack, renderMix, measure, encodeWav, ensureCtx, doAuto, refreshAll, applyGate, analyzePitch, applyTune, processTrack};
+window.__app = {applyFades, setTempo, tapTempo, beatSec, snapT, clickAt, H, undo, redo, commitHistory, resetHistory, play, curPos, makeZip, crc32, renderStem, mixTail, autosave, IDB, markDirty, buildProjectBlob, loadProjectBuffer, S, newTrack, renderMix, measure, encodeWav, ensureCtx, doAuto, refreshAll, applyGate, analyzePitch, applyTune, processTrack};
 </script>
 </body>
 </html>
