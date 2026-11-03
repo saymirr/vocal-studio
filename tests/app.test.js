@@ -415,6 +415,85 @@ async function check(name, fn) {
     assert.deepEqual(r.fx, [.25, .25, 2]); assert.ok(r.faded); assert.equal(r.first, 0); assert.equal(r.last, 0); assert.equal(r.origDry, .5, 'the saved audio stays unfaded');
   });
 
+  await check('split: halves are contiguous, keep settings, and fades stay on the outer edges only', async () => {
+    const r = await page.evaluate(() => {
+      const A = window.__app; A.S.tracks.length = 0; A.S.tempo.grid = false;
+      const buf = harm(48000, 2, () => ({ f: 220, amp: .2 })), t = A.newTrack('Verse', buf, .5);
+      Object.assign(t.fx, { midG: 3, rMix: 15, fadeIn: .2, fadeOut: .3 }); t.vol = -4; t.pan = .3; t.mute = false;
+      const ok = A.splitTrack(t, 1.5), edge = A.splitTrack(t, .51), outside = A.splitTrack(t, 9);
+      const [l, rt] = A.S.tracks, joined = new Float32Array(buf.length);
+      joined.set(l.orig.getChannelData(0), 0); joined.set(rt.orig.getChannelData(0), l.orig.length);
+      const orig = buf.getChannelData(0); let same = joined.length === orig.length; for (let i = 0; same && i < orig.length; i++) if (joined[i] !== orig[i]) same = false;
+      return { n: A.S.tracks.length, edge: edge, outside: outside, names: A.S.tracks.map(x => x.name), offsets: A.S.tracks.map(x => x.offset), lens: [l.orig.length, rt.orig.length], same,
+               left: { vol: l.vol, pan: l.pan, midG: l.fx.midG, rMix: l.fx.rMix, fi: l.fx.fadeIn, fo: l.fx.fadeOut }, right: { vol: rt.vol, pan: rt.pan, midG: rt.fx.midG, rMix: rt.fx.rMix, fi: rt.fx.fadeIn, fo: rt.fx.fadeOut }, ok: !!ok,
+               third: (() => { const x = A.splitTrack(rt, 2); return x && x.name; })() };
+    });
+    assert.ok(r.ok); assert.equal(r.edge, null, 'cut at the very edge is refused'); assert.equal(r.outside, null, 'cut outside the clip is refused');
+    assert.deepEqual(r.names, ['Verse', 'Verse (2)']); assert.deepEqual(r.offsets, [.5, 1.5]); assert.deepEqual(r.lens, [48000, 48000]); assert.ok(r.same, 'halves must concatenate to the original audio');
+    assert.deepEqual(r.left, { vol: -4, pan: .3, midG: 3, rMix: 15, fi: .2, fo: 0 }); assert.deepEqual(r.right, { vol: -4, pan: .3, midG: 3, rMix: 15, fi: 0, fo: .3 });
+    assert.equal(r.third, 'Verse (3)');
+  });
+
+  await check('split is seamless: the mix sounds the same before and after (EQ, delay, reverb)', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app; A.S.tracks.length = 0; A.S.master.drive = 0; A.S.master.gT = 0;
+      const rate = A.ensureCtx().sampleRate;      // audio at the context rate, as decodeAudioData produces for real imports
+      const t = A.newTrack('Seam', harm(rate, 2, tm => ({ f: 220 * (1 + .01 * Math.sin(tm * 6)), amp: .12 })), 0);
+      Object.assign(t.fx, { midG: 4, highG: 3, dMix: 20, dT: 200, rMix: 25, rSize: 1.2 });
+      const before = await A.renderMix(); A.splitTrack(t, .9); const after = await A.renderMix();
+      const a = before.getChannelData(0), b = after.getChannelData(0); let maxDiff = 0, peak = 0;
+      // compare up to the clip end: the ~40 ms after it is just the browser's compressors flushing their look-ahead delay
+      for (let i = 0; i < Math.round(2 * rate); i++) { maxDiff = Math.max(maxDiff, Math.abs(a[i] - b[i])); peak = Math.max(peak, Math.abs(a[i])); }
+      return { maxDiff, peak, lenSame: a.length === b.length, tracks: A.S.tracks.length };
+    });
+    assert.equal(r.tracks, 2); assert.ok(r.lenSame); assert.ok(r.peak > .05, 'signal present');
+    assert.ok(r.maxDiff < 1e-3, 'max difference ' + r.maxDiff.toExponential(2) + ' vs peak ' + r.peak.toFixed(3));
+  });
+
+  await check('split: undo restores the whole clip, redo splits it again (with auto-tune re-derived)', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app; A.S.tracks.length = 0; A.S.master.drive = 0; A.resetHistory();
+      const buf = harm(48000, 3, () => ({ f: 226, amp: .2 })), t = A.newTrack('Undo me', buf, 0); Object.assign(t.fx, { atOn: 1, atKey: 9, atSpeed: 0 }); A.commitHistory();
+      const until = async f => { for (let i = 0; i < 200 && !f(); i++) await new Promise(r => setTimeout(r, 50)); return f(); };
+      A.markDirty(); await A.processTrack(t); A.commitHistory();
+      const o = { orig: t.orig }; A.splitTrack(t, 1.5); A.commitHistory(); o.afterSplit = A.S.tracks.length;
+      o.halvesTuned = await until(() => A.S.tracks.every(x => x.buffer !== x.orig));
+      const msgSplit = document.querySelector('#status').textContent;
+      A.undo(); o.afterUndo = A.S.tracks.length; o.sameOrig = A.S.tracks[0].orig === o.orig; o.undoLen = A.S.tracks[0].orig.length;
+      o.retuned = await until(() => A.S.tracks[0].buffer !== A.S.tracks[0].orig && A.S.tracks[0].buffer.length === 144000);
+      o.undoMsg = document.querySelector('#status').textContent;
+      A.redo(); o.afterRedo = A.S.tracks.length; o.redoLens = A.S.tracks.map(x => x.orig.length);
+      o.redoTuned = await until(() => A.S.tracks.every(x => x.buffer !== x.orig)); delete o.orig; return o;
+    });
+    assert.equal(r.afterSplit, 2); assert.ok(r.halvesTuned, 'both halves get gate/tune/fade processing');
+    assert.equal(r.afterUndo, 1); assert.ok(r.sameOrig, 'undo brings back the identical full-length audio'); assert.equal(r.undoLen, 144000); assert.ok(r.retuned);
+    assert.match(r.undoMsg, /Undid: split clip “Undo me”/);
+    assert.equal(r.afterRedo, 2); assert.deepEqual(r.redoLens, [72000, 72000]); assert.ok(r.redoTuned);
+  });
+
+  await check('split from the UI: S key, Shift+S, the button and double-click', async () => {
+    await page.evaluate(() => {
+      const A = window.__app; A.S.tracks.length = 0; A.S.pps = 60; A.setTempo({ grid: false });
+      A.newTrack('A', harm(48000, 4, () => ({ f: 220, amp: .1 })), 0); A.newTrack('B', harm(48000, 4, () => ({ f: 330, amp: .1 })), 0);
+      A.S.selected = A.S.tracks[0].id; document.activeElement && document.activeElement.blur(); A.S.pos = 1;
+    });
+    await page.keyboard.press('s');                                                  // selected track only
+    let n = await page.evaluate(() => window.__app.S.tracks.map(t => t.name).join('|'));
+    assert.equal(n, 'A|A (2)|B', 'S splits only the selected track: ' + n);
+    await page.evaluate(() => { window.__app.S.pos = 3; });
+    await page.keyboard.press('Shift+S');                                            // every clip under the playhead
+    n = await page.evaluate(() => window.__app.S.tracks.map(t => t.name).join('|'));
+    assert.equal(n, 'A|A (2)|A (3)|B|B (2)', 'Shift+S splits every clip under the playhead: ' + n);
+    await page.evaluate(() => { window.__app.S.pos = 3.5; window.__app.S.selected = window.__app.S.tracks[0].id; });
+    await page.click('#btnSplit');                                                   // playhead outside the selected clip: refused with a hint
+    assert.match(await page.evaluate(() => document.querySelector('#status').textContent), /Move the playhead inside/);
+    await page.evaluate(() => { const A = window.__app; A.S.tracks.length = 0; A.newTrack('D', harm(48000, 4, () => ({ f: 220, amp: .1 })), 0); });
+    const box = await page.locator('.lane .area canvas').first().boundingBox();
+    await page.mouse.dblclick(box.x + 120, box.y + 40);                              // 2 s into the clip
+    const r = await page.evaluate(() => window.__app.S.tracks.map(t => [t.name, +t.offset.toFixed(2), +(t.orig.length / 48000).toFixed(2)]));
+    assert.equal(r.length, 2); assert.ok(Math.abs(r[0][2] - 2) < .05 && Math.abs(r[1][1] - 2) < .05, 'double-click split near 2 s: ' + JSON.stringify(r));
+  });
+
   await check('no errors were logged during the whole run', async () => {
     assert.deepEqual(errors, []);
   });

@@ -110,6 +110,7 @@ input[type=range]{accent-color:var(--accent)}
   <button id="btnStart" title="Go to start (Home)">⏮</button>
   <button id="btnPlay" class="primary" title="Play / pause (Space)">▶ Play</button>
   <button id="btnStop" title="Stop">■</button>
+  <button id="btnSplit" title="Split the selected clip at the playhead (S) — Shift+S splits every clip under the playhead. Or double-click a clip.">✂ Split</button>
   <button id="btnLoop" title="Loop playback — drag on the time ruler to set the loop region">🔁 Loop</button>
   <div class="sep"></div>
   <button id="btnClick" title="Metronome click (plays with the transport, never exported)">🎵 Click</button>
@@ -258,13 +259,14 @@ function setP(c, param, v, imm){ if (imm) param.value = v; else param.setTargetA
 function bq(c, type, f, g){ const n = c.createBiquadFilter(); n.type = type; if (f) n.frequency.value = f; if (g) n.gain.value = g; return n; }
 const BUTTERWORTH_Q = -3.0103; // Web Audio lowpass/highpass Q is in dB
 
+function mulberry32(a){ return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
 function makeIR(c, sec){
   const len = Math.max(1, Math.floor(c.sampleRate * sec));
   const buf = c.createBuffer(2, len, c.sampleRate);
   for (let ch = 0; ch < 2; ch++){
-    const d = buf.getChannelData(ch); let y = 0;
+    const d = buf.getChannelData(ch), rnd = mulberry32(7919 * (ch + 1) + Math.round(sec * 100)); let y = 0;     // seeded: same room every time
     for (let i = 0; i < len; i++){
-      const x = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 3);
+      const x = (rnd() * 2 - 1) * Math.pow(1 - i / len, 3);
       y += (x - y) * 0.35;               // dark the tail
       d[i] = y;
     }
@@ -786,24 +788,24 @@ function applyTune(buf, an, p){
   return out;
 }
 
-function scheduleProcess(t, delay){
+function scheduleProcess(t, delay, quiet){
   markDirty(); clearTimeout(t._pt);
-  t._pt = setTimeout(() => processTrack(t).catch(e => status('Processing failed: ' + e.message, true)), delay == null ? 250 : delay);
+  t._pt = setTimeout(() => processTrack(t, quiet).catch(e => status('Processing failed: ' + e.message, true)), delay == null ? 250 : delay);
 }
-async function processTrack(t){
+async function processTrack(t, quiet){      // quiet = don't overwrite the status line (used after undo / redo / split)
   if (!t.orig) return;
-  const id = t._proc = (t._proc || 0) + 1, p = t.fx;
+  const id = t._proc = (t._proc || 0) + 1, p = t.fx, say = (m, err) => { if (!quiet || err) status(m, err); };
   let b = t.orig, msg = [];
   if (p.ngT > -80){ b = applyGate(b, p); msg.push('gate'); }
   if (p.atOn){
     if (!t.pitch){
-      status('Analyzing pitch of “' + t.name + '”…');
-      t.pitchP = t.pitchP || analyzePitch(t.orig, pr => status('Analyzing pitch of “' + t.name + '”… ' + Math.round(pr * 100) + '%'));
+      say('Analyzing pitch of “' + t.name + '”…');
+      t.pitchP = t.pitchP || analyzePitch(t.orig, pr => say('Analyzing pitch of “' + t.name + '”… ' + Math.round(pr * 100) + '%'));
       t.pitch = await t.pitchP;
     }
     if (id !== t._proc) return;
     b = applyTune(b, t.pitch, p); msg.push('auto-tune');
-    if (t.pitch.voicedPct < .05) status('Auto-tune: very little pitched audio detected — works best on a dry, solo vocal.', true);
+    if (t.pitch.voicedPct < .05) say('Auto-tune: very little pitched audio detected — works best on a dry, solo vocal.', true);
   }
   if (id !== t._proc) return;
   if (p.fadeIn > 0 || p.fadeOut > 0){ b = applyFades(b, p); msg.push('fades'); }
@@ -811,7 +813,7 @@ async function processTrack(t){
   if (S.playing) play(curPos());
   renderTracks();
   if (S.tab === 'pitch' && S.selected === t.id) renderPanel();
-  if (msg.length && t.pitch && t.pitch.voicedPct >= .05 || !p.atOn) status(msg.length ? 'Applied ' + msg.join(' + ') + ' to “' + t.name + '”.' : 'Processing off for “' + t.name + '”.');
+  if (msg.length && t.pitch && t.pitch.voicedPct >= .05 || !p.atOn) say(msg.length ? 'Applied ' + msg.join(' + ') + ' to “' + t.name + '”.' : 'Processing off for “' + t.name + '”.');
 }
 
 /* ---------- metronome + tempo grid ----------
@@ -890,15 +892,58 @@ function renderTempoPanel(host, sel){
   d.append(Object.assign(el('div', 'hint', 'Snapping: hold Shift while dragging to move freely. Offset lines bar 1 up with your beat’s first downbeat.'), {style: 'font-size:11px;margin-top:4px'}));
 }
 
+/* ---------- clip splitting ----------
+   One clip per track, so a split leaves the left half in place and creates a new track (right below) for the right half,
+   with the same settings. Linear effects (EQ, delay, reverb, filters) sum back to exactly the original sound; compressor
+   and saturation envelopes restart at the cut. Fades stay on the outer edges only. */
+function sliceBuf(buf, a, b){
+  const o = new AudioBuffer({length: b - a, numberOfChannels: buf.numberOfChannels, sampleRate: buf.sampleRate});
+  for (let c = 0; c < buf.numberOfChannels; c++) o.copyToChannel(buf.getChannelData(c).subarray(a, b), c);
+  return o;
+}
+function nextSplitName(name){
+  const base = name.replace(/ \(\d+\)$/, ''), used = new Set(S.tracks.map(t => t.name));
+  for (let n = 2;; n++) if (!used.has(base + ' (' + n + ')')) return base + ' (' + n + ')';
+}
+function splitTrack(t, pos){
+  if (!t || !t.orig || S.recording) return null;
+  const sr = t.orig.sampleRate, N = t.orig.length, margin = Math.round(.02 * sr), cut = Math.round((pos - t.offset) * sr);
+  if (cut < margin || cut > N - margin) return null;
+  clearTimeout(t._pt); t._proc = (t._proc || 0) + 1;                       // drop any in-flight processing of the old, un-split audio
+  const right = {id: S.nextId++, name: nextSplitName(t.name), color: t.color, offset: t.offset + cut / sr, vol: t.vol, pan: t.pan, mute: t.mute, solo: t.solo,
+                 fx: {...t.fx, fadeIn: 0}, orig: sliceBuf(t.orig, cut, N), pitch: null};
+  right.buffer = right.orig; right.procSig = procSig(defaults(TRACK_FX));
+  t.orig = sliceBuf(t.orig, 0, cut); t.buffer = t.orig; t.pitch = null; t.pitchP = null; t.procSig = procSig(defaults(TRACK_FX)); t.fx.fadeOut = 0;
+  S.tracks.splice(S.tracks.indexOf(t) + 1, 0, right);
+  if (ctx) attachChain(right);
+  markDirty();
+  [t, right].forEach(x => { if (procSig(x.fx) !== x.procSig) scheduleProcess(x, 0, true); });   // gate / tune / fades for the new halves
+  return right;
+}
+function finishSplit(n){
+  if (S.playing) play(curPos());
+  renderTracks(); renderPanel();
+  status('Split ' + n + ' clip' + (n === 1 ? '' : 's') + '. Delete the part you don’t need with ✕, or drag the halves apart.');
+}
+function splitAtPlayhead(all){
+  if (S.recording) return;
+  const pos = curPos(), targets = all ? S.tracks.slice() : S.tracks.filter(t => t.id === S.selected);
+  const made = targets.map(t => splitTrack(t, pos)).filter(Boolean);
+  if (!made.length) return status(all ? 'No clip crosses the playhead.' : 'Move the playhead inside the selected clip first — or double-click a clip to split it there.', true);
+  finishSplit(made.length);
+}
+
 /* ---------- undo / redo ----------
    History = snapshots of the project *state* (track list, every track's settings, master settings). Audio buffers are
    immutable so snapshots only hold references. Gate / auto-tune output is re-derived on restore via procSig. */
 const H = {stack: [], idx: -1, timer: null, restoring: false};
+const bufIds = new WeakMap(); let bufSeq = 0;
+const bufId = b => b ? (bufIds.get(b) || (bufIds.set(b, ++bufSeq), bufSeq)) : 0;
 const procSig = fx => JSON.stringify([fx.ngT > -80 ? [fx.ngT, fx.ngRange, fx.ngA, fx.ngH, fx.ngR] : 0, fx.atOn ? [fx.atKey, fx.atScale, fx.atSpeed, fx.atAmt] : 0, fx.fadeIn > 0 || fx.fadeOut > 0 ? [fx.fadeIn, fx.fadeOut, fx.fadeCurve] : 0]);
 function snapshot(){
   const sn = {tracks: S.tracks.map(t => ({id: t.id, name: t.name, color: t.color, offset: t.offset, vol: t.vol, pan: t.pan, mute: t.mute, solo: t.solo, fx: {...t.fx}, orig: t.orig, pitch: t.pitch})),
               master: {...S.master}, tempo: {...S.tempo}, selected: S.selected};
-  sn.sig = JSON.stringify([sn.tracks.map(t => [t.id, t.name, t.offset, t.vol, t.pan, t.mute, t.solo, t.fx, !!t.orig]), sn.master, sn.tempo]);
+  sn.sig = JSON.stringify([sn.tracks.map(t => [t.id, t.name, t.offset, t.vol, t.pan, t.mute, t.solo, t.fx, bufId(t.orig)]), sn.master, sn.tempo]);
   return sn;
 }
 function updateHistoryUI(){
@@ -917,6 +962,7 @@ function commitHistory(){
 }
 function resetHistory(){ clearTimeout(H.timer); H.timer = null; H.stack = [snapshot()]; H.stack[0].sig = snapshot().sig; H.idx = 0; updateHistoryUI(); }
 function describeChange(a, b){      // a = state before, b = state after
+  if (b.tracks.length > a.tracks.length && b.tracks.some(tb => a.tracks.some(ta => ta.id === tb.id && ta.orig !== tb.orig))) return 'split clip “' + b.tracks.find(tb => a.tracks.some(ta => ta.id === tb.id && ta.orig !== tb.orig)).name + '”';
   if (b.tracks.length > a.tracks.length) return 'add track “' + b.tracks.find(t => !a.tracks.some(x => x.id === t.id)).name + '”';
   if (b.tracks.length < a.tracks.length) return 'remove track “' + a.tracks.find(t => !b.tracks.some(x => x.id === t.id)).name + '”';
   const names = {name: 'rename', offset: 'move clip', vol: 'volume', pan: 'pan', mute: 'mute', solo: 'solo'};
@@ -936,6 +982,7 @@ function applySnapshot(sn){
   for (const st of sn.tracks){
     let t = byId.get(st.id); byId.delete(st.id);
     if (!t) t = {id: st.id, buffer: st.orig, orig: st.orig, pitch: st.pitch, procSig: procSig(defaults(TRACK_FX))};     // a deleted track coming back
+    if (t.orig !== st.orig){ t.orig = st.orig; t.buffer = st.orig; t.pitch = st.pitch || null; t.pitchP = null; t.procSig = procSig(defaults(TRACK_FX)); t._proc = (t._proc || 0) + 1; }   // clip was split / un-split
     Object.assign(t, {name: st.name, color: st.color, offset: st.offset, vol: st.vol, pan: st.pan, mute: st.mute, solo: st.solo, fx: {...st.fx}});
     if (!t.pitch && st.pitch) t.pitch = st.pitch;
     next.push(t);
@@ -949,7 +996,7 @@ function applySnapshot(sn){
   refreshAll(true); renderTracks(); renderPanel();
   if (wasPlaying) play(pos);
   H.restoring = false;
-  redo.forEach(t => processTrack(t).catch(e => status('Processing failed: ' + e.message, true)));
+  redo.forEach(t => processTrack(t, true).catch(e => status('Processing failed: ' + e.message, true)));
 }
 function undo(){
   if (S.recording) return;
@@ -1268,7 +1315,12 @@ function renderTracks(){
       const cv = el('canvas'); cv.width = Math.max(1, Math.min(30000, Math.floor(t.buffer.duration * S.pps))); cv.height = 96;
       cv.style.left = Math.max(0, t.offset) * S.pps + 'px'; cv.style.width = cv.width + 'px';
       drawWave(cv, t.buffer, t.color); area.append(cv);
-      cv.title = 'Drag to move this clip';
+      cv.title = 'Drag to move · double-click to split here';
+      cv.ondblclick = e => {
+        e.stopPropagation();
+        const tl = snapT((e.clientX - area.getBoundingClientRect().left) / S.pps, e);
+        if (splitTrack(t, tl)) finishSplit(1); else status('Double-click inside the clip, away from its very edges, to split it.', true);
+      };
       const dur = t.buffer.duration, clipX = Math.max(0, t.offset) * S.pps;
       ['in', 'out'].forEach(side => {
         const key = side === 'in' ? 'fadeIn' : 'fadeOut', ov = el('div', 'fadeov'), hd = el('div', 'fadehd');
@@ -1445,6 +1497,7 @@ $('#btnRec').onclick = toggleRecord;
 $('#btnPlay').onclick = () => S.playing ? pause() : play(S.pos);
 $('#btnStop').onclick = stop;
 $('#btnLoop').onclick = toggleLoop;
+$('#btnSplit').onclick = e => splitAtPlayhead(e.shiftKey);
 $('#btnClick').onclick = () => setTempo({click: !S.tempo.click});
 $('#btnGrid').onclick = () => setTempo({grid: !S.tempo.grid});
 $('#bpm').onchange = e => setTempo({bpm: +e.target.value});
@@ -1464,6 +1517,7 @@ document.addEventListener('keydown', e => {
   if (/INPUT|SELECT|TEXTAREA/.test(e.target.tagName) && e.target.type !== 'range') return;
   if (e.code === 'Space'){ e.preventDefault(); S.playing ? pause() : play(S.pos); }
   if (e.code === 'Home') seek(0);
+  if (e.code === 'KeyS' && !e.ctrlKey && !e.metaKey){ e.preventDefault(); splitAtPlayhead(e.shiftKey); }
 });
 document.addEventListener('dragover', e => e.preventDefault());
 document.addEventListener('drop', e => {
@@ -1475,7 +1529,7 @@ document.addEventListener('drop', e => {
 window.addEventListener('beforeunload', e => { if (S.unsaved && S.tracks.some(t => t.orig)){ e.preventDefault(); e.returnValue = ''; } });
 setInterval(autosave, 10000); setInterval(metroTick, 25); updateTempoUI(); checkRestore(); resetHistory();
 renderTracks(); renderPanel();
-window.__app = {applyFades, setTempo, tapTempo, beatSec, snapT, clickAt, H, undo, redo, commitHistory, resetHistory, play, curPos, makeZip, crc32, renderStem, mixTail, autosave, IDB, markDirty, buildProjectBlob, loadProjectBuffer, S, newTrack, renderMix, measure, encodeWav, ensureCtx, doAuto, refreshAll, applyGate, analyzePitch, applyTune, processTrack};
+window.__app = {splitTrack, splitAtPlayhead, applyFades, setTempo, tapTempo, beatSec, snapT, clickAt, H, undo, redo, commitHistory, resetHistory, play, curPos, makeZip, crc32, renderStem, mixTail, autosave, IDB, markDirty, buildProjectBlob, loadProjectBuffer, S, newTrack, renderMix, measure, encodeWav, ensureCtx, doAuto, refreshAll, applyGate, analyzePitch, applyTune, processTrack};
 </script>
 </body>
 </html>
