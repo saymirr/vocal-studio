@@ -564,6 +564,80 @@ async function check(name, fn) {
     assert.ok(r.undone && r.redone, 'undo / redo'); assert.deepEqual(r.loaded, [1, 8, 2, 1]); assert.ok(r.halves, 'both halves of a split doubled clip are doubled'); assert.ok(r.off, 'disabling restores the original clip');
   });
 
+  // helper for the harmonizer tests: a stepped melody (midi + cents offset per second), the voice isolated by subtracting the lead
+  await page.addInitScript(() => {
+    window.melody = (sr, notes) => {
+      const n = Math.round(sr * notes.length), b = new AudioBuffer({ length: n, numberOfChannels: 1, sampleRate: sr }), d = b.getChannelData(0); let ph = 0;
+      for (let i = 0; i < n; i++) { const k = Math.min(notes.length - 1, Math.floor(i / sr)); ph += 2 * Math.PI * 440 * Math.pow(2, (notes[k] - 69) / 12) / sr; let s = 0; for (let h = 1; h <= 6; h++) s += Math.sin(h * ph) / h; d[i] = .15 * s; }
+      return b;
+    };
+    window.voiceNotes = async (A, lead, out, ch, nNotes) => {      // median pitch of (channel - lead) in the steady middle of each second, as midi
+      const sr = lead.sampleRate, d = lead.getChannelData(0), x = out.getChannelData(ch), v = new AudioBuffer({ length: d.length, numberOfChannels: 1, sampleRate: sr }), y = v.getChannelData(0);
+      for (let i = 0; i < d.length; i++) y[i] = x[i] - d[i];
+      const an = await A.analyzePitch(v), res = [];
+      for (let k = 0; k < nNotes; k++) { const vals = []; for (let f = 0; f < an.nF; f++) { const t = f * an.hop / sr; if (an.voiced[f] && t > k + .25 && t < k + .8) vals.push(an.f0[f]); } vals.sort((a, b) => a - b); res.push(69 + 12 * Math.log2(vals[vals.length >> 1] / 440)); }
+      return res;
+    };
+  });
+  await page.reload(); await page.evaluate(() => window.__app.ensureCtx());
+
+  await check('harmonizer: diatonic 3rds and 5ths land on the right scale notes (C major and A minor)', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app, sr = A.ensureCtx().sampleRate, base = { hmLevel: -6, hmLock: 100, hmDelay: 0, hmSpread: 100, hmTone: 16000, hmDrift: 0, hmV3: 0 };
+      const run = async (notes, key, scale, v1, v2) => {
+        const lead = melody(sr, notes), an = await A.analyzePitch(lead), out = A.applyHarmonizer(lead, an, { ...base, hmKey: key, hmScale: scale, hmV1: v1, hmV2: v2 }, null);
+        return { v1: await voiceNotes(A, lead, out, 0, notes.length), v2: await voiceNotes(A, lead, out, 1, notes.length), ch: out.numberOfChannels };
+      };
+      return { cmaj: await run([60, 64, 67], 0, 0, 6, 8), amin: await run([57, 60, 64], 9, 1, 6, 5) };   // C major: +3rd / +5th ;  A minor: +3rd / -3rd
+    });
+    const near = (got, want, what) => got.forEach((g, i) => assert.ok(Math.abs(g - want[i]) < .25, what + ' note ' + i + ': got midi ' + g.toFixed(2) + ', want ' + want[i]));
+    assert.equal(r.cmaj.ch, 2);
+    near(r.cmaj.v1, [64, 67, 71], 'C major +3rd (E G B)'); near(r.cmaj.v2, [67, 71, 74], 'C major +5th (G B D)');
+    near(r.amin.v1, [60, 64, 67], 'A minor +3rd (C E G)'); near(r.amin.v2, [53, 57, 60], 'A minor -3rd (F A C)');
+  });
+
+  await check('harmonizer: octaves, pitch lock vs natural, and level', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app, sr = A.ensureCtx().sampleRate, base = { hmKey: 0, hmScale: 0, hmLevel: -6, hmDelay: 0, hmSpread: 100, hmTone: 16000, hmDrift: 0, hmV3: 0 };
+      const o = {};
+      let lead = melody(sr, [60, 62]), an = await A.analyzePitch(lead), out = A.applyHarmonizer(lead, an, { ...base, hmLock: 100, hmV1: 10, hmV2: 1 }, null);
+      o.oct = { up: await voiceNotes(A, lead, out, 0, 2), down: await voiceNotes(A, lead, out, 1, 2) };
+      lead = melody(sr, [64.2, 64.2]); an = await A.analyzePitch(lead);                                    // E4, 20 cents sharp
+      const g = async lock => (await voiceNotes(A, lead, A.applyHarmonizer(lead, an, { ...base, hmLock: lock, hmV1: 6, hmV2: 0 }, null), 0, 2))[0];
+      o.locked = await g(100); o.natural = await g(0);
+      const d = lead.getChannelData(0), out2 = A.applyHarmonizer(lead, an, { ...base, hmLock: 100, hmV1: 6, hmV2: 0 }, null), L = out2.getChannelData(0); let e1 = 0, e2 = 0;
+      for (let i = sr; i < 2 * sr; i++) { e1 += d[i] * d[i]; e2 += (L[i] - d[i]) * (L[i] - d[i]); }
+      o.gain = Math.sqrt(e2 / e1); return o;
+    });
+    assert.ok(Math.abs(r.oct.up[0] - 72) < .25 && Math.abs(r.oct.up[1] - 74) < .25, 'octave up ' + r.oct.up.map(x => x.toFixed(2)));
+    assert.ok(Math.abs(r.oct.down[0] - 48) < .25 && Math.abs(r.oct.down[1] - 50) < .25, 'octave down ' + r.oct.down.map(x => x.toFixed(2)));
+    assert.ok(Math.abs(r.locked - 67) < .15, 'pitch lock 100 puts the 3rd dead-on G4: ' + r.locked.toFixed(3));
+    assert.ok(Math.abs(r.natural - 67.2) < .15, 'pitch lock 0 keeps the lead’s +20 cents: ' + r.natural.toFixed(3));
+    assert.ok(Math.abs(r.gain - Math.pow(10, -6 / 20)) < .08, 'voice level ' + r.gain.toFixed(3));
+  });
+
+  await check('harmonizer runs in the pipeline with the doubler, shares its pitch analysis, and survives undo, save/load and split', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app, sr = A.ensureCtx().sampleRate; A.S.tracks.length = 0; A.S.master.drive = 0; A.resetHistory();
+      const t = A.newTrack('Harm', melody(sr, [60, 64, 67, 64]), 0); A.commitHistory();
+      const until = async f => { for (let i = 0; i < 300 && !f(); i++) await new Promise(r => setTimeout(r, 50)); return f(); };
+      const o = {};
+      Object.assign(t.fx, { hmOn: 1, hmV1: 0, hmV2: 0, hmV3: 0 }); A.markDirty(); await A.processTrack(t);
+      o.allOff = t.buffer === t.orig && t.buffer.numberOfChannels === 1;                                    // no voices selected = untouched mono lead
+      Object.assign(t.fx, { atOn: 1, atKey: 0, atScale: 1, atSpeed: 0, dbOn: 1, hmV1: 6, hmV2: 8 }); A.markDirty(); await A.processTrack(t);
+      const an1 = t.dblPitch; o.both = t.buffer.numberOfChannels === 2 && t.buffer !== t.orig;
+      t.fx.hmV3 = 10; await A.processTrack(t); o.cached = t.dblPitch === an1; A.commitHistory();
+      A.undo(); o.undone = await until(() => t.fx.hmV3 === 0); A.redo(); o.redone = await until(() => t.fx.hmV3 === 10 && t.buffer.numberOfChannels === 2);
+      const ab = await A.buildProjectBlob().arrayBuffer(); A.S.tracks.length = 0; await A.loadProjectBuffer(ab);
+      const u = A.S.tracks[0]; o.loaded = [u.fx.hmOn, u.fx.hmV1, u.fx.hmV2, u.fx.hmV3, u.buffer.numberOfChannels];
+      A.splitTrack(u, 2); o.split = await until(() => A.S.tracks.length === 2 && A.S.tracks.every(x => x.buffer !== x.orig && x.buffer.numberOfChannels === 2));
+      let finite = true; for (const x of A.S.tracks) for (let c = 0; c < 2; c++) { const d = x.buffer.getChannelData(c); for (let i = 0; i < d.length; i += 97) if (!isFinite(d[i]) || Math.abs(d[i]) > 4) finite = false; }
+      o.finite = finite; return o;
+    });
+    assert.ok(r.allOff, 'with every voice Off the lead is untouched'); assert.ok(r.both, 'doubler + harmonizer make a stereo clip'); assert.ok(r.cached, 'adding a voice reuses the cached analysis');
+    assert.ok(r.undone && r.redone, 'undo / redo'); assert.deepEqual(r.loaded, [1, 6, 8, 10, 2]); assert.ok(r.split, 'both halves are harmonized'); assert.ok(r.finite, 'no NaN or runaway samples');
+  });
+
   await check('no errors were logged during the whole run', async () => {
     assert.deepEqual(errors, []);
   });

@@ -175,6 +175,17 @@ const SCALES = [
   {name:'Minor pentatonic', m:[0,3,5,7,10]},
   {name:'Blues',            m:[0,3,5,6,7,10]},
 ];
+const HARM_SCALES = [   // 7-note scales, so "3rd / 5th / octave" are exact scale steps (2 / 4 / 7)
+  {name:'Major',          m:[0,2,4,5,7,9,11]},
+  {name:'Minor',          m:[0,2,3,5,7,8,10]},
+  {name:'Dorian',         m:[0,2,3,5,7,9,10]},
+  {name:'Mixolydian',     m:[0,2,4,5,7,9,10]},
+  {name:'Harmonic minor', m:[0,2,3,5,7,8,11]},
+];
+const HARM_INTERVALS = [   // steps = scale steps above (+) or below (-) the sung note
+  {label:'Off', steps:0}, {label:'−Octave', steps:-7}, {label:'−6th', steps:-5}, {label:'−5th', steps:-4}, {label:'−4th', steps:-3}, {label:'−3rd', steps:-2},
+  {label:'+3rd', steps:2}, {label:'+4th', steps:3}, {label:'+5th', steps:4}, {label:'+6th', steps:5}, {label:'+Octave', steps:7},
+];
 const TRACK_FX = [
   {sec:'Clean-up'},
   {k:'hp',   label:'Low cut',        min:20,  max:400,  step:1,   def:80,   u:'Hz'},
@@ -194,6 +205,19 @@ const TRACK_FX = [
   {k:'dbDelay',  label:'Time offset',   min:0,   max:80, step:1,  def:22,   u:'ms',    proc:1},
   {k:'dbSpread', label:'Stereo spread', min:0,   max:100,step:1,  def:80,   u:'%',     proc:1},
   {k:'dbTone',   label:'Brightness',    min:2000,max:16000,step:100,def:9000,u:'Hz',   note:'Low-pass on the doubles so they sit behind the lead', proc:1},
+  {sec:'Harmonizer (follows the lead in key)'},
+  {k:'hmOn',    type:'toggle', label:'Enable', def:0, proc:1},
+  {k:'hmKey',   type:'select', label:'Song key',   options:KEYS, def:0, proc:1},
+  {k:'hmScale', type:'select', label:'Scale',      options:HARM_SCALES.map(x => x.name), def:0, proc:1},
+  {k:'hmV1',    type:'select', label:'Voice 1 (L)', options:HARM_INTERVALS.map(x => x.label), def:6, proc:1},
+  {k:'hmV2',    type:'select', label:'Voice 2 (R)', options:HARM_INTERVALS.map(x => x.label), def:8, proc:1},
+  {k:'hmV3',    type:'select', label:'Voice 3 (C)', options:HARM_INTERVALS.map(x => x.label), def:0, proc:1},
+  {k:'hmLevel', label:'Harmony level', min:-24, max:0,   step:.5, def:-8,   u:'dB', proc:1},
+  {k:'hmLock',  label:'Pitch lock',    min:0,   max:100, step:1,  def:60,   u:'%',  note:'100 = harmony always dead-on in tune; 0 = it inherits the lead’s pitch wobble', proc:1},
+  {k:'hmDelay', label:'Time offset',   min:0,   max:60,  step:1,  def:15,   u:'ms', proc:1},
+  {k:'hmSpread',label:'Stereo spread', min:0,   max:100, step:1,  def:70,   u:'%',  proc:1},
+  {k:'hmTone',  label:'Brightness',    min:2000,max:16000,step:100,def:8000,u:'Hz', proc:1},
+  {k:'hmDrift', label:'Humanize',      min:0,   max:20,  step:1,  def:4,    u:'cents', note:'Slow random pitch wander per voice', proc:1},
   {sec:'Fades (clip start / end)'},
   {k:'fadeIn',  label:'Fade in',    min:0, max:10, step:.01, def:0, u:'s', note:'Also draggable on the clip', proc:1},
   {k:'fadeOut', label:'Fade out',   min:0, max:10, step:.01, def:0, u:'s', note:'Also draggable on the clip', proc:1},
@@ -254,6 +278,12 @@ const TRACK_PRESETS = {
   'Doubler: subtle':   {__merge:1,dbOn:1,dbVoices:0,dbLevel:-10,dbDetune:6, dbDrift:4,dbDelay:18,dbSpread:60,dbTone:8000},
   'Doubler: wide pop': {__merge:1,dbOn:1,dbVoices:1,dbLevel:-6, dbDetune:10,dbDrift:6,dbDelay:24,dbSpread:90,dbTone:9000},
   'Doubler: tight':    {__merge:1,dbOn:1,dbVoices:1,dbLevel:-8, dbDetune:5, dbDrift:3,dbDelay:12,dbSpread:50,dbTone:10000},
+  // harmonizer presets keep your key / scale
+  'Harmony: 3rd above':        {__merge:1,hmOn:1,hmV1:6,hmV2:0, hmV3:0},
+  'Harmony: 3rd + 5th above':  {__merge:1,hmOn:1,hmV1:6,hmV2:8, hmV3:0},
+  'Harmony: 3rd below':        {__merge:1,hmOn:1,hmV1:5,hmV2:0, hmV3:0},
+  'Harmony: octave stack':     {__merge:1,hmOn:1,hmV1:1,hmV2:10,hmV3:0},
+  'Harmony: choir (3rd, 5th, octave)': {__merge:1,hmOn:1,hmV1:6,hmV2:8,hmV3:10,hmLevel:-10},
   'Auto-tune: natural':      {__merge:1,atOn:1,atSpeed:70,atAmt:70},
   'Auto-tune: hard (T-Pain)':{__merge:1,atOn:1,atSpeed:0,atAmt:100},
 };
@@ -811,8 +841,7 @@ function smoothNoise(seed, nF, hopSec, periodSec){
 }
 function applyDoubler(buf, an, p){
   const sr = buf.sampleRate, N = buf.length, nch = buf.numberOfChannels, hopSec = an.hop / sr;
-  const mono = new AudioBuffer({length: N, numberOfChannels: 1, sampleRate: sr}), m = mono.getChannelData(0);
-  for (let c = 0; c < nch; c++){ const d = buf.getChannelData(c); for (let i = 0; i < N; i++) m[i] += d[i] / nch; }
+  const mono = monoOf(buf);
   const g = Math.pow(10, p.dbLevel / 20), spread = p.dbSpread / 100, a = 1 - Math.exp(-2 * Math.PI * p.dbTone / sr);
   const voices = p.dbVoices === 0 ? [{sign: 1, pan: 1, dly: 1, seed: 101}] : [{sign: -1, pan: -1, dly: 1, seed: 101}, {sign: 1, pan: 1, dly: 1.25, seed: 202}];
   const out = new AudioBuffer({length: N, numberOfChannels: 2, sampleRate: sr}), L = out.getChannelData(0), R = out.getChannelData(1);
@@ -821,9 +850,55 @@ function applyDoubler(buf, an, p){
     const noise = smoothNoise(v.seed, an.nF, hopSec, .7);
     const shifted = psola(mono, an, ts => Math.pow(2, (v.sign * p.dbDetune + p.dbDrift * noise(ts / an.hop)) / 1200)).getChannelData(0);
     const th = (clamp(v.pan * spread, -1, 1) + 1) * Math.PI / 4, gl = g * Math.cos(th), gr = g * Math.sin(th), dly = Math.round(p.dbDelay / 1000 * sr * v.dly);
-    let y1 = 0, y2 = 0;
-    for (let i = 0; i < N; i++){ y1 += a * (shifted[i] - y1); y2 += a * (y1 - y2); const j = i + dly; if (j < N){ L[j] += gl * y2; R[j] += gr * y2; } }   // 2-pole low-pass, then delay
+    addVoice(L, R, shifted, gl, gr, dly, a);
   }
+  return out;
+}
+function monoOf(buf){
+  const N = buf.length, nch = buf.numberOfChannels, mono = new AudioBuffer({length: N, numberOfChannels: 1, sampleRate: buf.sampleRate}), m = mono.getChannelData(0);
+  for (let c = 0; c < nch; c++){ const d = buf.getChannelData(c); for (let i = 0; i < N; i++) m[i] += d[i] / nch; }
+  return mono;
+}
+function addVoice(L, R, x, gl, gr, dly, a){        // 2-pole low-pass, delay, then pan-mix into the stereo bus
+  const N = x.length; let y1 = 0, y2 = 0;
+  for (let i = 0; i < N; i++){ y1 += a * (x[i] - y1); y2 += a * (y1 - y2); const j = i + dly; if (j < N){ L[j] += gl * y2; R[j] += gr * y2; } }
+}
+
+// Harmonizer: pitch-shifted copies that sit on the scale note N steps above / below whatever the lead is singing.
+function harmonyRatios(an, sr, p, steps){
+  const sc = HARM_SCALES[p.hmScale].m, key = p.hmKey, notes = [];
+  for (let n = 0; n < 128; n++) if (sc.includes(((n - key) % 12 + 12) % 12)) notes.push(n);
+  const lock = p.hmLock / 100, alpha = 1 - Math.exp(-(an.hop / sr * 1000) / 25);         // ~25 ms glide between harmony notes
+  const r = new Float32Array(an.nF).fill(1); let s = 0, prev = null;
+  for (let f = 0; f < an.nF; f++){
+    if (!an.voiced[f]){ prev = null; continue; }
+    const m = f2m(an.f0[f]); let bi = 0, bd = 1e9;
+    for (let i = 0; i < notes.length; i++){ const d = Math.abs(notes[i] - m); if (d < bd){ bd = d; bi = i; } else if (notes[i] > m) break; }
+    if (prev !== null && prev !== bi && Math.abs(m - notes[prev]) <= bd + .08) bi = prev;   // small hysteresis so vibrato can't flip the degree
+    const first = prev === null; prev = bi;
+    const ti = clamp(bi + steps, 0, notes.length - 1), want = notes[ti] + (m - notes[bi]) * (1 - lock) - m;   // lock 100 = dead-on, 0 = keeps the lead's pitch wobble
+    s = first ? want : s + (want - s) * alpha;
+    r[f] = Math.pow(2, clamp(s, -14, 14) / 12);
+  }
+  return r;
+}
+function applyHarmonizer(buf, an, p, base){            // base = stereo buffer to add into (e.g. the doubler's output), or null
+  const sr = buf.sampleRate, N = buf.length, hopSec = an.hop / sr, slots = [p.hmV1, p.hmV2, p.hmV3], pans = [-1, 1, 0], delays = [1, 1.4, 1.8];
+  if (!slots.some(v => HARM_INTERVALS[v] && HARM_INTERVALS[v].steps !== 0)) return base;
+  let out = base;
+  if (!out){ out = new AudioBuffer({length: N, numberOfChannels: 2, sampleRate: sr}); out.getChannelData(0).set(buf.getChannelData(0)); out.getChannelData(1).set(buf.getChannelData(buf.numberOfChannels > 1 ? 1 : 0)); }
+  const L = out.getChannelData(0), R = out.getChannelData(1), mono = monoOf(buf);
+  const g = Math.pow(10, p.hmLevel / 20), spread = p.hmSpread / 100, a = 1 - Math.exp(-2 * Math.PI * p.hmTone / sr);
+  slots.forEach((v, i) => {
+    const steps = (HARM_INTERVALS[v] || {steps: 0}).steps; if (!steps) return;
+    const ratio = harmonyRatios(an, sr, p, steps), noise = smoothNoise(303 + i * 101, an.nF, hopSec, .8), nF = an.nF;
+    const shifted = psola(mono, an, ts => {
+      const x = ts / an.hop, k = Math.floor(x), fr = x - k, r0 = ratio[clamp(k, 0, nF - 1)], r1 = ratio[clamp(k + 1, 0, nF - 1)];
+      return (r0 + (r1 - r0) * fr) * Math.pow(2, p.hmDrift * noise(x) / 1200);
+    }).getChannelData(0);
+    const th = (clamp(pans[i] * spread, -1, 1) + 1) * Math.PI / 4;
+    addVoice(L, R, shifted, g * Math.cos(th), g * Math.sin(th), Math.round(p.hmDelay / 1000 * sr * delays[i]), a);
+  });
   return out;
 }
 async function ensureOrigPitch(t, say){
@@ -850,7 +925,7 @@ async function processTrack(t, quiet){      // quiet = don't overwrite the statu
     if (t.pitch.voicedPct < .05) say('Auto-tune: very little pitched audio detected — works best on a dry, solo vocal.', true);
   }
   if (id !== t._proc) return;
-  if (p.dbOn){
+  if (p.dbOn || p.hmOn){
     let an;
     if (p.atOn){          // the doubler follows the *tuned* vocal, so it needs its own pitch analysis (cached until gate / tune settings change)
       const key = JSON.stringify([p.ngT > -80 ? [p.ngT, p.ngRange, p.ngA, p.ngH, p.ngR] : 0, p.atKey, p.atScale, p.atSpeed, p.atAmt]);
@@ -861,10 +936,13 @@ async function processTrack(t, quiet){      // quiet = don't overwrite the statu
       an = t.dblPitch;
     } else an = await ensureOrigPitch(t, say);
     if (id !== t._proc) return;
-    if (an.voicedPct < .05) say('Doubler: very little pitched audio detected — the double will just be a delayed copy.', true);
-    say('Applying the doubler to “' + t.name + '”…'); await new Promise(r => setTimeout(r, 20));      // let the status paint before the heavy synchronous pass
+    if (an.voicedPct < .05) say('Doubler / harmonizer: very little pitched audio detected — the extra voices will just be delayed copies.', true);
+    say('Adding voices to “' + t.name + '”…'); await new Promise(r => setTimeout(r, 20));      // let the status paint before the heavy synchronous pass
     if (id !== t._proc) return;
-    b = applyDoubler(b, an, p); msg.push('doubler');
+    let out = null;
+    if (p.dbOn){ out = applyDoubler(b, an, p); msg.push('doubler'); }
+    if (p.hmOn){ out = applyHarmonizer(b, an, p, out); msg.push('harmonizer'); }      // harmonies are built from the lead, not from the doubles
+    if (out) b = out;
   }
   if (id !== t._proc) return;
   if (p.fadeIn > 0 || p.fadeOut > 0){ b = applyFades(b, p); msg.push('fades'); }
@@ -998,7 +1076,7 @@ function splitAtPlayhead(all){
 const H = {stack: [], idx: -1, timer: null, restoring: false};
 const bufIds = new WeakMap(); let bufSeq = 0;
 const bufId = b => b ? (bufIds.get(b) || (bufIds.set(b, ++bufSeq), bufSeq)) : 0;
-const procSig = fx => JSON.stringify([fx.ngT > -80 ? [fx.ngT, fx.ngRange, fx.ngA, fx.ngH, fx.ngR] : 0, fx.atOn ? [fx.atKey, fx.atScale, fx.atSpeed, fx.atAmt] : 0, fx.dbOn ? [fx.dbVoices, fx.dbLevel, fx.dbDetune, fx.dbDrift, fx.dbDelay, fx.dbSpread, fx.dbTone] : 0, fx.fadeIn > 0 || fx.fadeOut > 0 ? [fx.fadeIn, fx.fadeOut, fx.fadeCurve] : 0]);
+const procSig = fx => JSON.stringify([fx.ngT > -80 ? [fx.ngT, fx.ngRange, fx.ngA, fx.ngH, fx.ngR] : 0, fx.atOn ? [fx.atKey, fx.atScale, fx.atSpeed, fx.atAmt] : 0, fx.hmOn ? [fx.hmKey, fx.hmScale, fx.hmV1, fx.hmV2, fx.hmV3, fx.hmLevel, fx.hmLock, fx.hmDelay, fx.hmSpread, fx.hmTone, fx.hmDrift] : 0, fx.dbOn ? [fx.dbVoices, fx.dbLevel, fx.dbDetune, fx.dbDrift, fx.dbDelay, fx.dbSpread, fx.dbTone] : 0, fx.fadeIn > 0 || fx.fadeOut > 0 ? [fx.fadeIn, fx.fadeOut, fx.fadeCurve] : 0]);
 function snapshot(){
   const sn = {tracks: S.tracks.map(t => ({id: t.id, name: t.name, color: t.color, offset: t.offset, vol: t.vol, pan: t.pan, mute: t.mute, solo: t.solo, fx: {...t.fx}, orig: t.orig, pitch: t.pitch})),
               master: {...S.master}, tempo: {...S.tempo}, selected: S.selected};
@@ -1588,7 +1666,7 @@ document.addEventListener('drop', e => {
 window.addEventListener('beforeunload', e => { if (S.unsaved && S.tracks.some(t => t.orig)){ e.preventDefault(); e.returnValue = ''; } });
 setInterval(autosave, 10000); setInterval(metroTick, 25); updateTempoUI(); checkRestore(); resetHistory();
 renderTracks(); renderPanel();
-window.__app = {applyDoubler, splitTrack, splitAtPlayhead, applyFades, setTempo, tapTempo, beatSec, snapT, clickAt, H, undo, redo, commitHistory, resetHistory, play, curPos, makeZip, crc32, renderStem, mixTail, autosave, IDB, markDirty, buildProjectBlob, loadProjectBuffer, S, newTrack, renderMix, measure, encodeWav, ensureCtx, doAuto, refreshAll, applyGate, analyzePitch, applyTune, processTrack};
+window.__app = {applyHarmonizer, harmonyRatios, applyDoubler, splitTrack, splitAtPlayhead, applyFades, setTempo, tapTempo, beatSec, snapT, clickAt, H, undo, redo, commitHistory, resetHistory, play, curPos, makeZip, crc32, renderStem, mixTail, autosave, IDB, markDirty, buildProjectBlob, loadProjectBuffer, S, newTrack, renderMix, measure, encodeWav, ensureCtx, doAuto, refreshAll, applyGate, analyzePitch, applyTune, processTrack};
 </script>
 </body>
 </html>
