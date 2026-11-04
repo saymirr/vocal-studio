@@ -131,7 +131,7 @@ input[type=range]{accent-color:var(--accent)}
   </select>
   <button id="btnAuto">Auto-level master</button>
   <div class="sep"></div>
-  <select id="bits"><option value="16">WAV 16-bit</option><option value="24" selected>WAV 24-bit</option></select>
+  <select id="bits" title="Export format"><option value="16">WAV 16-bit</option><option value="24" selected>WAV 24-bit</option><option value="mp3-128">MP3 128 kbps</option><option value="mp3-192">MP3 192 kbps</option><option value="mp3-256">MP3 256 kbps</option><option value="mp3-320">MP3 320 kbps</option></select>
   <button id="btnExport" class="primary">⬇ Export mix</button>
   <button id="btnStems" title="One WAV per track (after track FX, before master) in a .zip">⬇ Stems (.zip)</button>
 </header>
@@ -626,7 +626,7 @@ async function renderStem(t, len){      // one track through its own chain only 
 async function doStems(){
   const ts = S.tracks.filter(t => t.buffer);
   if (!ts.length) throw new Error('Nothing to export — add audio first.');
-  const len = projectDuration() + mixTail(), bits = +$('#bits').value, files = [], used = new Set();
+  const fmt = $('#bits').value, mp3 = fmt.startsWith('mp3'), len = projectDuration() + mixTail(), bits = mp3 ? 24 : +fmt, files = [], used = new Set();     // stems are always WAV (MP3's encoder delay would offset them)
   for (let i = 0; i < ts.length; i++){
     status('Rendering stem ' + (i + 1) + ' of ' + ts.length + '…');
     const data = new Uint8Array(await encodeWav(await renderStem(ts[i], len), bits).arrayBuffer());
@@ -635,7 +635,51 @@ async function doStems(){
     used.add(nm.toLowerCase()); files.push({name: String(i + 1).padStart(2, '0') + ' - ' + nm + '.wav', data});
   }
   const zip = makeZip(files); saveBlob(zip, 'stems-' + new Date().toISOString().slice(0, 10) + '.zip');
-  status('Exported ' + files.length + ' stem' + (files.length === 1 ? '' : 's') + ' (' + bits + '-bit WAV, all the same length so they line up in any DAW) · ' + (zip.size / 1048576).toFixed(1) + ' MB.');
+  status('Exported ' + files.length + ' stem' + (files.length === 1 ? '' : 's') + ' (' + bits + '-bit WAV' + (mp3 ? ' — stems are always WAV' : '') + ', all the same length so they line up in any DAW) · ' + (zip.size / 1048576).toFixed(1) + ' MB.');
+}
+/* ---------- MP3 export (lamejs, loaded only when needed; LGPL, kept as a separate file in vendor/) ---------- */
+const LAME_SRC = [
+  {url: 'vendor/lame.min.js'},
+  {url: 'https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js', integrity: 'sha384-xuasJXVcyv3hZq0eYpelEkBC8l4yufatZXDsKuyCU2rqfhDCb+ftuE/mSfZAteiK'},
+];
+let lamePromise = null;
+function loadLame(){
+  if (window.lamejs && window.lamejs.Mp3Encoder) return Promise.resolve();
+  if (lamePromise) return lamePromise;
+  lamePromise = (async () => {
+    for (const src of LAME_SRC){
+      try {
+        await new Promise((res, rej) => {
+          const sc = document.createElement('script'); sc.src = src.url; sc.onload = res; sc.onerror = () => rej(new Error('load failed'));
+          if (src.integrity){ sc.integrity = src.integrity; sc.crossOrigin = 'anonymous'; }
+          document.head.append(sc);
+        });
+        if (window.lamejs && window.lamejs.Mp3Encoder) return;
+      } catch (e){ /* try the next source */ }
+    }
+    lamePromise = null;
+    throw new Error('The MP3 encoder (vendor/lame.min.js) could not be loaded. Keep the “vendor” folder next to index.html, or connect to the internet once. WAV export always works offline.');
+  })();
+  return lamePromise;
+}
+async function resampleTo(buf, rate){
+  const oc = new OfflineAudioContext(buf.numberOfChannels, Math.ceil(buf.duration * rate), rate), s = oc.createBufferSource();
+  s.buffer = buf; s.connect(oc.destination); s.start(); return oc.startRendering();
+}
+async function encodeMp3(buf, kbps, onProgress){
+  await loadLame();
+  const b = [32000, 44100, 48000].includes(buf.sampleRate) ? buf : await resampleTo(buf, 44100);   // MP3 only supports these rates
+  const ch = Math.min(2, b.numberOfChannels), enc = new lamejs.Mp3Encoder(ch, b.sampleRate, kbps);
+  const toI16 = f => { const o = new Int16Array(f.length); for (let i = 0; i < f.length; i++){ const v = clamp(f[i], -1, 1); o[i] = v < 0 ? v * 32768 : v * 32767; } return o; };
+  const l = toI16(b.getChannelData(0)), r = ch > 1 ? toI16(b.getChannelData(1)) : null, parts = [], block = 1152 * 8;
+  let tlast = performance.now();
+  for (let i = 0; i < l.length; i += block){
+    const out = r ? enc.encodeBuffer(l.subarray(i, i + block), r.subarray(i, i + block)) : enc.encodeBuffer(l.subarray(i, i + block));
+    if (out.length) parts.push(new Uint8Array(out));
+    if (performance.now() - tlast > 40){ if (onProgress) onProgress(i / l.length); await new Promise(res => setTimeout(res)); tlast = performance.now(); }   // keep the page responsive
+  }
+  const tail = enc.flush(); if (tail.length) parts.push(new Uint8Array(tail));
+  return new Blob(parts, {type: 'audio/mpeg'});
 }
 async function doAnalyze(){
   status('Rendering…'); const buf = await renderMix(); const m = await measure(buf);
@@ -657,11 +701,17 @@ async function doAuto(){
          (Math.abs(m.lufs - target) > 1 ? 'Limiter ceiling is capping loudness — lower the ceiling or glue threshold.' : ''));
 }
 async function doExport(){
+  const fmt = $('#bits').value, date = new Date().toISOString().slice(0, 10);
   status('Rendering mix…');
-  const buf = await renderMix(), bits = +$('#bits').value;
-  const url = URL.createObjectURL(encodeWav(buf, bits));
-  const a = el('a'); a.href = url; a.download = 'mix-' + new Date().toISOString().slice(0, 10) + '.wav'; document.body.append(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 10000);
+  const buf = await renderMix();
+  if (fmt.startsWith('mp3')){
+    const kbps = +fmt.split('-')[1], blob = await encodeMp3(buf, kbps, pr => status('Encoding MP3 (' + kbps + ' kbps)… ' + Math.round(pr * 100) + '%'));
+    saveBlob(blob, 'mix-' + date + '.mp3');
+    status('Exported MP3 · ' + kbps + ' kbps · ' + buf.duration.toFixed(1) + 's · ' + (blob.size / 1048576).toFixed(1) + ' MB. Use WAV for archiving or further editing.');
+    return;
+  }
+  const bits = +fmt;
+  saveBlob(encodeWav(buf, bits), 'mix-' + date + '.wav');
   status('Exported ' + bits + '-bit WAV · ' + buf.duration.toFixed(1) + 's · ' + buf.sampleRate + ' Hz');
 }
 
@@ -1666,7 +1716,7 @@ document.addEventListener('drop', e => {
 window.addEventListener('beforeunload', e => { if (S.unsaved && S.tracks.some(t => t.orig)){ e.preventDefault(); e.returnValue = ''; } });
 setInterval(autosave, 10000); setInterval(metroTick, 25); updateTempoUI(); checkRestore(); resetHistory();
 renderTracks(); renderPanel();
-window.__app = {applyHarmonizer, harmonyRatios, applyDoubler, splitTrack, splitAtPlayhead, applyFades, setTempo, tapTempo, beatSec, snapT, clickAt, H, undo, redo, commitHistory, resetHistory, play, curPos, makeZip, crc32, renderStem, mixTail, autosave, IDB, markDirty, buildProjectBlob, loadProjectBuffer, S, newTrack, renderMix, measure, encodeWav, ensureCtx, doAuto, refreshAll, applyGate, analyzePitch, applyTune, processTrack};
+window.__app = {encodeMp3, loadLame, applyHarmonizer, harmonyRatios, applyDoubler, splitTrack, splitAtPlayhead, applyFades, setTempo, tapTempo, beatSec, snapT, clickAt, H, undo, redo, commitHistory, resetHistory, play, curPos, makeZip, crc32, renderStem, mixTail, autosave, IDB, markDirty, buildProjectBlob, loadProjectBuffer, S, newTrack, renderMix, measure, encodeWav, ensureCtx, doAuto, refreshAll, applyGate, analyzePitch, applyTune, processTrack};
 </script>
 </body>
 </html>

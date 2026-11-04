@@ -24,6 +24,7 @@ jobs:
         run: |
           mkdir _site
           cp index.html _site/
+          cp -r vendor _site/vendor       # lame.min.js (LGPL) for MP3 export, loaded on demand
           touch _site/.nojekyll
 
       - uses: actions/configure-pages@v5

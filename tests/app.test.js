@@ -8,7 +8,13 @@ const http = require('node:http');
 const { spawnSync } = require('node:child_process');
 const INDEX = path.resolve(__dirname, '..', 'index.html');
 // Served over http://localhost so IndexedDB (autosave) behaves like it does for real users.
-const server = http.createServer((req, res) => { res.setHeader('content-type', 'text/html'); res.end(fs.readFileSync(INDEX)); });
+const server = http.createServer((req, res) => {
+  const url = req.url.split('?')[0];
+  if (/^\/vendor\/[\w.-]+$/.test(url) && fs.existsSync(path.join(__dirname, '..', url))) {       // only the vendor/ folder, no path traversal
+    res.setHeader('content-type', url.endsWith('.js') ? 'text/javascript' : 'text/plain'); return res.end(fs.readFileSync(path.join(__dirname, '..', url)));
+  }
+  res.setHeader('content-type', 'text/html'); res.end(fs.readFileSync(INDEX));
+});
 const OUT = path.resolve(__dirname, '..', 'test-output');
 fs.mkdirSync(OUT, { recursive: true });
 
@@ -636,6 +642,68 @@ async function check(name, fn) {
     });
     assert.ok(r.allOff, 'with every voice Off the lead is untouched'); assert.ok(r.both, 'doubler + harmonizer make a stereo clip'); assert.ok(r.cached, 'adding a voice reuses the cached analysis');
     assert.ok(r.undone && r.redone, 'undo / redo'); assert.deepEqual(r.loaded, [1, 6, 8, 10, 2]); assert.ok(r.split, 'both halves are harmonized'); assert.ok(r.finite, 'no NaN or runaway samples');
+  });
+
+  await check('mp3: encodes valid audio — frame sync, size, and a decode that matches the source (SNR)', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app, sr = A.ensureCtx().sampleRate, secs = 3, n = Math.round(sr * secs);
+      const buf = new AudioBuffer({ length: n, numberOfChannels: 2, sampleRate: sr }), l = buf.getChannelData(0), rr = buf.getChannelData(1);
+      for (let i = 0; i < n; i++) { const t = i / sr; l[i] = .3 * Math.sin(2 * Math.PI * 440 * t) + .1 * Math.sin(2 * Math.PI * 1330 * t); rr[i] = .3 * Math.sin(2 * Math.PI * 660 * t) + .1 * Math.sin(2 * Math.PI * 1771.3 * t); }   // a second, non-harmonic partial keeps the alignment unambiguous
+      let progress = 0; const blob = await A.encodeMp3(buf, 192, p => { progress = Math.max(progress, p); }), bytes = new Uint8Array(await blob.arrayBuffer());
+      const dec = await A.ensureCtx().decodeAudioData(bytes.buffer.slice(0));
+      const dl = dec.getChannelData(0), dr = dec.getChannelData(1);
+      const align = (src, out) => { let best = -1, lag = 0; for (let k = 0; k < 3000; k++) { let c = 0; for (let i = 5000; i < 25000; i++) c += src[i] * out[i + k]; if (c > best) { best = c; lag = k; } } return lag; };
+      const snr = (src, out, lag) => { let sp = 0, np = 0, xy = 0, yy = 0; for (let i = 8000; i < n - 8000; i++) { xy += src[i] * out[i + lag]; yy += out[i + lag] * out[i + lag]; }
+        const g = xy / yy; for (let i = 8000; i < n - 8000; i++) { const d = src[i] - g * out[i + lag]; sp += src[i] * src[i]; np += d * d; } return 10 * Math.log10(sp / np); };
+      const lagL = align(l, dl), lagR = align(rr, dr);
+      return { sync: [bytes[0], bytes[1] & 0xE0], size: blob.size, type: blob.type, ch: dec.numberOfChannels, dur: dec.duration, lagL, lagR, snrL: snr(l, dl, lagL), snrR: snr(rr, dr, lagR), progress, want: 192000 / 8 * secs };
+    });
+    assert.deepEqual(r.sync, [0xFF, 0xE0], 'MPEG frame sync'); assert.equal(r.type, 'audio/mpeg'); assert.equal(r.ch, 2);
+    assert.ok(Math.abs(r.size - r.want) / r.want < .1, 'size ' + r.size + ' vs ~' + r.want + ' bytes for 192 kbps');
+    assert.ok(Math.abs(r.dur - 3) < .1, 'decoded duration ' + r.dur.toFixed(3) + ' s');
+    assert.ok(r.lagL > 500 && r.lagL < 2500 && Math.abs(r.lagL - r.lagR) <= 1, 'encoder delay ~1100 samples, same on both channels: ' + r.lagL + '/' + r.lagR);
+    assert.ok(r.snrL > 25 && r.snrR > 25, 'decoded vs source SNR ' + r.snrL.toFixed(1) + ' / ' + r.snrR.toFixed(1) + ' dB (channels not swapped or scrambled)');
+  });
+
+  await check('mp3: mono input and non-MP3 sample rates (resampled) keep their pitch and duration', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app, ctxRate = A.ensureCtx().sampleRate, o = {};
+      for (const [name, rate, ch] of [['mono', ctxRate, 1], ['rate96k', 96000, 2]]) {
+        const n = rate * 2, b = new AudioBuffer({ length: n, numberOfChannels: ch, sampleRate: rate });
+        for (let c = 0; c < ch; c++) { const d = b.getChannelData(c); for (let i = 0; i < n; i++) d[i] = .3 * Math.sin(2 * Math.PI * 440 * i / rate); }
+        const bytes = new Uint8Array(await (await A.encodeMp3(b, 128)).arrayBuffer()), dec = await A.ensureCtx().decodeAudioData(bytes.buffer.slice(0));
+        const an = await A.analyzePitch(dec); o[name] = { ch: dec.numberOfChannels, dur: dec.duration, f: medianF0(an) };
+      }
+      return o;
+    });
+    assert.equal(r.mono.ch, 1); assert.equal(r.rate96k.ch, 2);
+    for (const k of ['mono', 'rate96k']) { assert.ok(Math.abs(r[k].dur - 2) < .1, k + ' duration ' + r[k].dur.toFixed(3)); assert.ok(Math.abs(r[k].f - 440) < 3, k + ' pitch ' + r[k].f.toFixed(1) + ' Hz'); }
+  });
+
+  await check('mp3: the Export button downloads a playable .mp3 (and stems stay WAV)', async () => {
+    await page.evaluate(() => { const A = window.__app; A.S.tracks.length = 0; A.S.master.drive = 0; A.newTrack('Exp', harm(A.ensureCtx().sampleRate, 2, () => ({ f: 220, amp: .2 })), 0); });
+    await page.selectOption('#bits', 'mp3-128');
+    const [dl] = await Promise.all([page.waitForEvent('download', { timeout: 30000 }), page.click('#btnExport')]);
+    const file = path.join(OUT, 'export.mp3'); await dl.saveAs(file); const bytes = fs.readFileSync(file);
+    assert.ok(/^mix-\d{4}-\d{2}-\d{2}\.mp3$/.test(dl.suggestedFilename()), dl.suggestedFilename()); assert.ok(bytes.length > 20000, 'size ' + bytes.length); assert.equal(bytes[0], 0xFF);
+    const dec = await page.evaluate(async b64 => { const u = Uint8Array.from(atob(b64), c => c.charCodeAt(0)), d = await window.__app.ensureCtx().decodeAudioData(u.buffer); return { dur: d.duration, ch: d.numberOfChannels }; }, bytes.toString('base64'));
+    assert.ok(dec.dur > 2.2 && dec.dur < 3.2 && dec.ch === 2, 'decodes to ' + JSON.stringify(dec));
+    assert.match(await page.evaluate(() => document.querySelector('#status').textContent), /Exported MP3 · 128 kbps/);
+    const [sd] = await Promise.all([page.waitForEvent('download', { timeout: 30000 }), page.click('#btnStems')]);
+    assert.match(sd.suggestedFilename(), /^stems-.*\.zip$/); const zf = path.join(OUT, 'stems-mp3-selected.zip'); await sd.saveAs(zf);
+    const py = spawnSync('python3', ['-c', 'import zipfile,sys;print("|".join(zipfile.ZipFile(sys.argv[1]).namelist()))', zf], { encoding: 'utf8' });
+    assert.equal(py.stdout.trim(), '01 - Exp.wav'); await page.selectOption('#bits', '24');
+  });
+
+  await check('mp3: a missing encoder gives a clear error and WAV export still works', async () => {
+    const p2 = await browser.newPage(), errs2 = []; p2.on('pageerror', e => errs2.push(e.message));
+    await p2.route(/lame\.min\.js/, r => r.abort());                                  // neither vendor/ nor the CDN fallback is reachable
+    await p2.goto(URL); await p2.evaluate(() => { const A = window.__app, sr = A.ensureCtx().sampleRate, b = new AudioBuffer({ length: sr, numberOfChannels: 1, sampleRate: sr }); b.getChannelData(0).fill(.1); A.newTrack('X', b, 0); });
+    await p2.selectOption('#bits', 'mp3-192'); await p2.click('#btnExport');
+    await p2.waitForFunction(() => /could not be loaded/.test(document.querySelector('#status').textContent), null, { timeout: 15000 });
+    assert.equal(await p2.evaluate(() => document.querySelector('#status').className), 'err');
+    await p2.selectOption('#bits', '24'); const [dl] = await Promise.all([p2.waitForEvent('download', { timeout: 20000 }), p2.click('#btnExport')]);
+    assert.match(dl.suggestedFilename(), /\.wav$/); assert.deepEqual(errs2, []); await p2.close();
   });
 
   await check('no errors were logged during the whole run', async () => {

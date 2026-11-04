@@ -43,8 +43,17 @@ then open <http://localhost:8000>.
 | **Clip splitting** | Cut a clip at the playhead with **✂ Split** or the `S` key (`Shift+S` cuts every clip under the playhead), or **double-click** a clip to split exactly there (snaps to the grid when it is on, Shift = free). The right half becomes a new track directly below with identical settings; fades stay on the outer edges only. Delete the part you don't want, or drag the pieces apart to re-arrange a take. Undo restores the whole clip. |
 | **Fades** | Per-track **fade in / fade out** (up to 10 s) with linear, equal-power or S-curve shapes. Set them with the sliders in *Track FX → Fades* or by **dragging the white handles** at the top corners of a clip (they snap to the grid when it is on, Shift = free). Fades are applied before the effects chain (so reverb and delay tails ring out naturally) and are identical in playback, mix export and stems. They are saved in projects and covered by undo. |
 | **Timeline** | Drag clips to reposition them, drag on the ruler to set a **loop region**, click the ruler to seek. |
-| **Export** | 16-bit (dithered) or 24-bit WAV of the mix, or **stems**: one WAV per track in a `.zip`, all the same length so they line up in any DAW. |
+| **Export** | 16-bit (dithered) or 24-bit WAV, or **MP3** at 128 / 192 / 256 / 320 kbps (constant bit rate, stereo, 44.1 or 48 kHz; other sample rates are converted). **Stems** are always WAV: one WAV per track in a `.zip`, all the same length so they line up in any DAW. |
 | **Projects** | Save and open `.vstudio` files containing your audio and every setting. **Autosave** keeps a recovery copy in your browser every 10 seconds and offers to restore it if the tab was closed. |
+
+## MP3 export and the `vendor/` folder
+
+Browsers can't write MP3 natively, so MP3 export uses [lamejs](https://github.com/zhuker/lamejs) (a JavaScript port of the LAME encoder, **LGPL-3.0**). To keep `index.html` free of third-party code, lamejs lives as a separate, unmodified file in [`vendor/`](vendor/) and is loaded **only when you export an MP3**:
+
+1. from `vendor/lame.min.js` next to `index.html` (this is what the hosted site and a cloned repo use), then
+2. as a fallback, from a pinned jsDelivr URL with a Subresource Integrity hash (so a downloaded lone `index.html` can still make MP3s while online).
+
+If neither can be loaded you get a clear message, and WAV export keeps working offline. MP3 files carry no ID3 tags and have the usual ~25 ms encoder delay, which is why stems stay WAV and WAV is the format to archive or keep editing. Encoding runs at roughly 8× real time (about 20 s for a 3-minute song) with a progress readout. Aim for a master ceiling of −1 dB or lower so MP3's inter-sample peaks don't clip.
 
 ## Using it
 
@@ -52,7 +61,7 @@ then open <http://localhost:8000>.
 2. **Shape each track** in the *Track FX* tab: gate → EQ → de-esser → compressor → warmth/delay/reverb. Double-click any slider to reset it.
 3. **Tune it** (optional): open the *Pitch graph* tab, press *Analyze pitch*, set the key and scale, enable *Auto-tune* and watch the corrected curve snap to the notes.
 4. **Master the mix** in the *Master / Mastering* tab, then use *Auto-level master* to hit a loudness target.
-5. **Export** the mix as WAV, and **Save project** (Ctrl+S) to come back to it later.
+5. **Export** the mix as WAV or MP3, and **Save project** (Ctrl+S) to come back to it later.
 
 Keyboard: `Space` play/pause, `Home` go to start, `S` split, `Shift+S` split all, `Ctrl+S` save project, `Ctrl+Z` undo, `Ctrl+Shift+Z` / `Ctrl+Y` redo.
 
@@ -85,7 +94,7 @@ npx playwright install chromium   # first time only
 npm test
 ```
 
-The tests in [`tests/app.test.js`](tests/app.test.js) load the page in headless Chromium and exercise the audio engine with synthetic signals: noise gate depth, auto-tune accuracy, loudness targeting, WAV output, project round-trips, the pitch graph, stem ZIP validity, loop playback, clip dragging, autosave/restore, the spectrum analyzer, undo/redo, the tempo grid, metronome scheduling, snapping and count-in, fade math, handles and persistence, the vocal doubler (voice pitch, level, delay, tuned-source and caching), the harmonizer (diatonic intervals in major and minor, octaves, pitch lock, level, pipeline) and clip splitting (contiguity, seamless mix, undo/redo, keyboard and double-click). If your machine already has a Chromium binary, point `CHROMIUM_PATH` at it instead of installing one.
+The tests in [`tests/app.test.js`](tests/app.test.js) load the page in headless Chromium and exercise the audio engine with synthetic signals: noise gate depth, auto-tune accuracy, loudness targeting, WAV output, project round-trips, the pitch graph, stem ZIP validity, loop playback, clip dragging, autosave/restore, the spectrum analyzer, undo/redo, the tempo grid, metronome scheduling, snapping and count-in, fade math, handles and persistence, the vocal doubler (voice pitch, level, delay, tuned-source and caching), the harmonizer (diatonic intervals in major and minor, octaves, pitch lock, level, pipeline), clip splitting, and MP3 export (valid frames, size, decoded SNR, mono and 96 kHz input, the download button, and the missing-encoder error path) (contiguity, seamless mix, undo/redo, keyboard and double-click). If your machine already has a Chromium binary, point `CHROMIUM_PATH` at it instead of installing one.
 
 ### Continuous integration
 
