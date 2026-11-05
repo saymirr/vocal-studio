@@ -706,6 +706,120 @@ async function check(name, fn) {
     assert.match(dl.suggestedFilename(), /\.wav$/); assert.deepEqual(errs2, []); await p2.close();
   });
 
+  // generators for the tempo-detection tests: a drum pattern (kick accented on beat 1, snare on 2 & 4, off-beat hats) and a fuller mix
+  await page.addInitScript(() => {
+    const lcg = seed => () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296 * 2 - 1; };
+    window.drums = (sr, bpm, secs, o = {}) => {
+      const first = o.first ?? .35, perBar = o.perBar ?? 4, jit = o.jitter ?? 0, beat = 60 / bpm, n = Math.round(sr * secs), rnd = lcg(o.seed ?? 7);
+      const buf = new AudioBuffer({ length: n, numberOfChannels: 1, sampleRate: sr }), d = buf.getChannelData(0);
+      const hit = (t, fn, len) => { const s0 = Math.round(t * sr); for (let i = 0; i < len && s0 + i < n; i++) if (s0 + i >= 0) d[s0 + i] += fn(i / sr); };
+      for (let k = 0; first + k * beat < secs - .3; k++) {
+        const t = first + k * beat + (jit ? rnd() * jit : 0), bar = k % perBar;
+        hit(t, u => (bar === 0 ? 1 : .6) * Math.sin(2 * Math.PI * (45 * u + 2.5 * (1 - Math.exp(-u * 30)))) * Math.exp(-u * 22), Math.round(.25 * sr));
+        if (bar % 2 === 1) hit(t, u => .5 * rnd() * Math.exp(-u * 28), Math.round(.15 * sr));
+        hit(t + beat / 2 + (jit ? rnd() * jit : 0), u => .22 * rnd() * Math.exp(-u * 160), Math.round(.05 * sr));
+      }
+      for (let i = 0; i < n; i++) d[i] += .04 * Math.sin(2 * Math.PI * 110 * i / sr) + rnd() * .01;
+      return buf;
+    };
+    window.fullSong = (sr, bpm, secs, first, seed) => {
+      const beat = 60 / bpm, n = Math.round(sr * secs), buf = new AudioBuffer({ length: n, numberOfChannels: 2, sampleRate: sr }), L = buf.getChannelData(0), R = buf.getChannelData(1), rnd = lcg(seed);
+      const add = (t, fn, len, pan = .5) => { const s0 = Math.round(t * sr); for (let i = 0; i < len && s0 + i < n; i++) if (s0 + i >= 0) { const v = fn(i / sr); L[s0 + i] += v * (1 - pan); R[s0 + i] += v * pan; } };
+      const chords = [[220, 277, 330], [196, 247, 294], [175, 220, 262], [196, 247, 294]];
+      for (let k = 0; first + k * beat < secs - .5; k++) {
+        const t = first + k * beat, bar = k % 4, root = chords[Math.floor(k / 4) % 4][0] / 4;
+        add(t, u => (bar === 0 ? 1 : .65) * Math.sin(2 * Math.PI * (45 * u + 2.5 * (1 - Math.exp(-u * 30)))) * Math.exp(-u * 20), Math.round(.28 * sr));
+        if (bar % 2 === 1) add(t, u => .45 * rnd() * Math.exp(-u * 30), Math.round(.14 * sr), .45);
+        add(t + beat / 2, u => .2 * rnd() * Math.exp(-u * 150), Math.round(.05 * sr), .7); add(t, u => .3 * Math.sin(2 * Math.PI * root * u) * Math.exp(-u * 3), Math.round(beat * .9 * sr));
+      }
+      for (let b = 0; first + b * 4 * beat < secs; b++) for (const f of chords[b % 4]) add(first + b * 4 * beat, u => .07 * Math.sin(2 * Math.PI * f * u) * Math.min(1, u * 8), Math.round(4 * beat * sr));
+      for (let k = 0; first + k * beat < secs - .5; k += 2) { const f = [440, 494, 523, 587, 659][k % 5]; add(first + k * beat + .01, u => .1 * Math.sin(2 * Math.PI * f * u * (1 + .004 * Math.sin(2 * Math.PI * 5.5 * u))) * Math.min(1, u * 20) * Math.exp(-u * 1.2), Math.round(beat * 1.8 * sr), .6); }
+      return buf;
+    };
+    window.barErr = (got, want, bpm, perBar = 4) => { const bar = 60 / bpm * perBar; return ((got - want + bar / 2) % bar + bar) % bar - bar / 2; };
+  });
+  await page.reload(); await page.evaluate(() => window.__app.ensureCtx());
+
+  await check('tempo detection: BPM and bar-1 position are accurate across tempos, with jitter, and in 3/4', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app, sr = A.ensureCtx().sampleRate, rows = [];
+      for (const [bpm, first] of [[90, .35], [100, .2], [120, .35], [128, .5], [140, .1]]) { const x = await A.detectTempo(drums(sr, bpm, 40, { first }), { beatsPerBar: 4 }); rows.push({ bpm, got: x.bpm, conf: x.conf, errMs: barErr(x.offset, first, bpm) * 1000 }); }
+      const j = await A.detectTempo(drums(sr, 110, 40, { first: .3, jitter: .012, seed: 3 }), { beatsPerBar: 4 }); rows.push({ bpm: 110, got: j.bpm, conf: j.conf, errMs: barErr(j.offset, .3, 110) * 1000, note: 'jitter ±12 ms' });
+      const w = await A.detectTempo(drums(sr, 120, 40, { first: .45, perBar: 3 }), { beatsPerBar: 3 }); rows.push({ bpm: 120, got: w.bpm, conf: w.conf, errMs: barErr(w.offset, .45, 120, 3) * 1000, note: '3/4' });
+      return rows;
+    });
+    for (const x of r) { const tag = x.bpm + ' BPM ' + (x.note || ''); assert.ok(Math.abs(x.got - x.bpm) <= .3, tag + ': got ' + x.got); assert.ok(x.conf > .6, tag + ' confidence ' + x.conf.toFixed(2)); assert.ok(Math.abs(x.errMs) <= 20, tag + ': bar 1 is off by ' + x.errMs.toFixed(1) + ' ms'); }
+  });
+
+  await check('tempo detection: a full mix (bass, chords, vibrato lead, drums), and a 200 s track', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app, sr = A.ensureCtx().sampleRate, rows = [];
+      for (const [bpm, first, seed] of [[96, .62, 1], [126, 1.05, 3]]) { const x = await A.detectTempo(fullSong(sr, bpm, 45, first, seed), { beatsPerBar: 4 }); rows.push({ bpm, got: x.bpm, conf: x.conf, errMs: barErr(x.offset, first, bpm) * 1000 }); }
+      const t0 = performance.now(), x = await A.detectTempo(fullSong(sr, 124, 200, .4, 9), { beatsPerBar: 4 }); rows.push({ bpm: 124, got: x.bpm, conf: x.conf, errMs: barErr(x.offset, .4, 124) * 1000, sec: (performance.now() - t0) / 1000 });
+      return rows;
+    });
+    for (const x of r) { assert.ok(Math.abs(x.got - x.bpm) <= .3, x.bpm + ': got ' + x.got); assert.ok(x.conf > .6); assert.ok(Math.abs(x.errMs) <= 25, x.bpm + ': bar 1 off by ' + x.errMs.toFixed(1) + ' ms'); }
+    assert.ok(r[2].sec < 15, 'a 200 s track analysed in ' + r[2].sec.toFixed(1) + ' s');
+  });
+
+  await check('tempo detection: half / double time is always offered as an alternative', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app, sr = A.ensureCtx().sampleRate, rows = [];
+      for (const [bpm, first] of [[150, .3], [174, .25]]) { const x = await A.detectTempo(drums(sr, bpm, 40, { first }), { beatsPerBar: 4 }); rows.push({ bpm, got: x.bpm, alts: x.alts }); }
+      return rows;
+    });
+    for (const x of r) { const ok = Math.abs(x.got - x.bpm) <= .3 || (Math.abs(x.got - x.bpm / 2) <= .3 && x.alts.some(a => Math.abs(a - x.bpm) <= .3)); assert.ok(ok, x.bpm + ' BPM -> ' + x.got + ' with alternatives ' + x.alts); }
+  });
+
+  await check('tempo detection: refuses material without a steady beat, silence and clips that are too short', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app, sr = A.ensureCtx().sampleRate, mk = (secs, f) => { const b = new AudioBuffer({ length: Math.round(sr * secs), numberOfChannels: 1, sampleRate: sr }), d = b.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = f(i / sr, i); return b; };
+      let sd = 5; const rn = () => { sd = (sd * 1664525 + 1013904223) >>> 0; return sd / 4294967296 * 2 - 1; };
+      const conf = async b => (await A.detectTempo(b, { beatsPerBar: 4 })).conf, o = {};
+      o.pad = await conf(mk(30, t => .3 * Math.sin(2 * Math.PI * 220 * t) + .2 * Math.sin(2 * Math.PI * 330 * t)));
+      o.noise = await conf(mk(30, () => .2 * rn()));
+      o.vibrato = await conf(mk(30, t => (.3 + .1 * Math.sin(2 * Math.PI * .4 * t)) * Math.sin(2 * Math.PI * 220 * t * (1 + .003 * Math.sin(2 * Math.PI * 5 * t)))));
+      o.silent = await A.detectTempo(mk(10, () => 0), {}).then(() => 'no error', e => e.message);
+      o.short = await A.detectTempo(mk(2, () => .1 * rn()), {}).then(() => 'no error', e => e.message);
+      const t = A.newTrack('Pad only', mk(20, t => .3 * Math.sin(2 * Math.PI * 220 * t)), 0);
+      o.noBeat = await A.detectTempoForTrack(t).then(() => 'applied', e => e.message); o.gridStayedOff = !A.S.tempo.grid; return o;
+    });
+    for (const k of ['pad', 'noise', 'vibrato']) assert.ok(r[k] < .12, k + ' confidence ' + r[k].toFixed(2) + ' should be below the 0.12 refusal threshold');
+    assert.match(r.silent, /silent/); assert.match(r.short, /at least about 4 seconds/); assert.match(r.noBeat, /No steady beat found/); assert.ok(r.gridStayedOff, 'a refused detection must not touch the grid');
+  });
+
+  await check('tempo detection: accounts for the clip position on the timeline', async () => {
+    const r = await page.evaluate(async () => {
+      const A = window.__app, sr = A.ensureCtx().sampleRate; A.S.tracks.length = 0; A.setTempo({ bpm: 120, num: 4, den: 4, grid: false, offset: 0 });
+      const t = A.newTrack('Placed', drums(sr, 120, 30, { first: .35 }), .6);              // downbeat is 0.35 s into the clip, the clip starts at 0.6 s
+      const x = await A.detectTempoForTrack(t); return { bpm: A.S.tempo.bpm, off: A.S.tempo.offset, grid: A.S.tempo.grid, barSecs: 2, conf: x.conf };
+    });
+    assert.equal(r.bpm, 120); assert.ok(r.grid); assert.ok(Math.abs(r.off - .95) <= .02, 'bar 1 on the timeline at ' + r.off.toFixed(3) + ' s (want 0.95)');
+  });
+
+  await check('import flow: offer -> detect -> grid on and undoable -> alternatives; Dismiss hides the offer', async () => {
+    const wav = await page.evaluate(async () => { const A = window.__app, b = drums(A.ensureCtx().sampleRate, 128, 20, { first: .5 }); const u = new Uint8Array(await A.encodeWav(b, 16).arrayBuffer()); let s = ''; for (let i = 0; i < u.length; i += 8192) s += String.fromCharCode(...u.subarray(i, i + 8192)); return btoa(s); });
+    const f = path.join(OUT, 'beat-128.wav'); fs.writeFileSync(f, Buffer.from(wav, 'base64'));
+    await page.evaluate(() => { const A = window.__app; A.S.tracks.length = 0; A.setTempo({ bpm: 120, num: 4, den: 4, grid: false, offset: 0, click: false, countIn: 0 }); A.resetHistory(); });
+    await page.setInputFiles('#file', f); await page.waitForSelector('#tempoBar:not([hidden])', { timeout: 10000 });
+    assert.match(await page.textContent('#tempoBarTxt'), /beat-128/);
+    await page.click('#tempoBarNo'); assert.equal(await page.evaluate(() => document.querySelector('#tempoBar').hidden), true, 'Dismiss hides the offer');
+    await page.evaluate(() => { window.__app.S.tracks.length = 0; });
+    await page.setInputFiles('#file', f); await page.waitForSelector('#tempoBar:not([hidden])', { timeout: 10000 });
+    await page.click('#tempoBarYes'); await page.waitForFunction(() => window.__app.S.tempo.grid, null, { timeout: 30000 });
+    const r = await page.evaluate(() => ({ ...window.__app.S.tempo, status: document.querySelector('#status').textContent, barHidden: document.querySelector('#tempoBar').hidden }));
+    assert.equal(r.bpm, 128); assert.ok(Math.abs(r.offset - .5) <= .02, 'bar 1 at ' + r.offset); assert.ok(r.barHidden); assert.match(r.status, /Detected 128 BPM \(strong confidence\)/);
+    await page.evaluate(() => { window.__app.commitHistory(); }); await page.evaluate(() => document.activeElement && document.activeElement.blur());
+    await page.keyboard.press('Control+z');
+    const u = await page.evaluate(() => ({ bpm: window.__app.S.tempo.bpm, grid: window.__app.S.tempo.grid })); assert.deepEqual(u, { bpm: 120, grid: false }, 'one Ctrl+Z restores the old tempo and hides the grid');
+    await page.keyboard.press('Control+Shift+Z');
+    await page.click('[data-tab=tempo]'); await page.waitForSelector('.tempocard');
+    assert.match(await page.textContent('.tempocard'), /128 BPM/);
+    await page.click('.tempocard button >> text=÷2'); assert.equal(await page.evaluate(() => window.__app.S.tempo.bpm), 64, 'the ÷2 button sets half time');
+    assert.equal(await page.locator('.tempocard button >> text=×2').count(), 0, '×2 of 128 would be 256 BPM, above the 240 limit, so it is not offered');
+    await page.click('.tempocard button >> text=Use 128'); assert.equal(await page.evaluate(() => window.__app.S.tempo.bpm), 128, '"Use 128" restores the detected tempo');
+  });
+
   await check('no errors were logged during the whole run', async () => {
     assert.deepEqual(errors, []);
   });

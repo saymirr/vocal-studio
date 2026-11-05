@@ -50,8 +50,12 @@ header{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 12px;b
 .head input[type=number]{width:62px;background:#0b0d11;border:1px solid var(--line);border-radius:4px;padding:1px 4px}
 .lane .area{position:relative;flex:none;background:repeating-linear-gradient(90deg,transparent 0 59px,#14171d 59px 60px);cursor:pointer}
 .lane .area canvas{position:absolute;top:0;height:96px;border-radius:4px;opacity:.95}
-#restoreBar{display:flex;gap:10px;align-items:center;padding:6px 12px;background:#2a2410;border-bottom:1px solid #5a4a14;color:#ffd77a}
-#restoreBar[hidden]{display:none}
+#restoreBar,#tempoBar{display:flex;gap:10px;align-items:center;padding:6px 12px;background:#2a2410;border-bottom:1px solid #5a4a14;color:#ffd77a}
+#restoreBar[hidden],#tempoBar[hidden]{display:none}
+#tempoBar{background:#10282a;border-bottom-color:#1d5a5e;color:#8ae8dc}
+.tempocard{background:#0b0d11;border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin:6px 0;line-height:1.7}
+.tempocard b{color:var(--accent2)}
+.tempocard button{margin:2px 4px 2px 0;padding:3px 10px}
 button:disabled{opacity:.4;cursor:default;border-color:var(--line)}
 .fadeov{position:absolute;top:0;height:96px;background:rgba(255,255,255,.12);pointer-events:none;z-index:1}
 .fadehd{position:absolute;top:3px;width:11px;height:11px;border-radius:3px;background:#fff;border:2px solid var(--c);cursor:ew-resize;z-index:2;opacity:.9;touch-action:none}
@@ -137,6 +141,7 @@ input[type=range]{accent-color:var(--accent)}
 </header>
 
 <div id="restoreBar" hidden><span id="restoreTxt"></span><button id="restoreYes" class="primary">Restore</button><button id="restoreNo">Discard</button></div>
+<div id="tempoBar" hidden><span id="tempoBarTxt"></span><button id="tempoBarYes" class="primary">🎯 Detect tempo</button><button id="tempoBarNo">Dismiss</button></div>
 <div id="stage"><div id="inner"></div></div>
 
 <div id="bottom">
@@ -407,7 +412,7 @@ const S = {
   tempo: {...TEMPO_DEFAULT},
   tracks: [], master: defaults(MASTER_FX), selected: null, tab: 'track',
   playing: false, startCtx: 0, startPos: 0, pos: 0, pps: 60, nextId: 1, recording: null,
-  loop: {on: false, a: 0, b: 0}, unsaved: false, autoDirty: false, specView: null,
+  loop: {on: false, a: 0, b: 0}, tempoInfo: null, unsaved: false, autoDirty: false, specView: null,
 };
 let ctx = null, live = null, sources = [], dragSuppress = false;
 function markDirty(){ S.unsaved = true; S.autoDirty = true; scheduleCommit(); }
@@ -517,7 +522,7 @@ async function importFiles(files){
     try {
       status('Decoding ' + f.name + '…');
       const buf = await ctx.decodeAudioData(await f.arrayBuffer());
-      newTrack(f.name.replace(/\.[^.]+$/, ''), buf, 0);
+      offerTempoDetect(newTrack(f.name.replace(/\.[^.]+$/, ''), buf, 0));
       status('Loaded ' + f.name + ' (' + buf.duration.toFixed(1) + 's).');
     } catch (e){ status('Could not decode ' + f.name + ': ' + e.message, true); }
   }
@@ -1003,6 +1008,118 @@ async function processTrack(t, quiet){      // quiet = don't overwrite the statu
   if (msg.length && t.pitch && t.pitch.voicedPct >= .05 || !p.atOn) say(msg.length ? 'Applied ' + msg.join(' + ') + ' to “' + t.name + '”.' : 'Processing off for “' + t.name + '”.');
 }
 
+/* ---------- tempo detection ----------
+   Onset strength (log-spectral flux on a ~11 kHz mix) -> autocorrelation with a tempo prior (resolves half / double time)
+   -> pulse-train search for a precise BPM and beat phase -> downbeat guess from the low-frequency (kick) onsets. */
+const FFT_CACHE = {};
+function fftTables(n){
+  if (FFT_CACHE[n]) return FFT_CACHE[n];
+  const cos = new Float64Array(n / 2), sin = new Float64Array(n / 2), rev = new Uint16Array(n), bits = Math.log2(n);
+  for (let i = 0; i < n / 2; i++){ cos[i] = Math.cos(2 * Math.PI * i / n); sin[i] = -Math.sin(2 * Math.PI * i / n); }
+  for (let i = 0; i < n; i++){ let r = 0; for (let b = 0; b < bits; b++) if (i >> b & 1) r |= 1 << (bits - 1 - b); rev[i] = r; }
+  return FFT_CACHE[n] = {cos, sin, rev};
+}
+function fft(re, im){
+  const n = re.length, T = fftTables(n);
+  for (let i = 0; i < n; i++){ const j = T.rev[i]; if (j > i){ let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; } }
+  for (let len = 2; len <= n; len <<= 1){
+    const half = len >> 1, step = n / len;
+    for (let i = 0; i < n; i += len) for (let k = 0; k < half; k++){
+      const wr = T.cos[k * step], wi = T.sin[k * step], a = i + k, b = a + half, tr = re[b] * wr - im[b] * wi, ti = re[b] * wi + im[b] * wr;
+      re[b] = re[a] - tr; im[b] = im[a] - ti; re[a] += tr; im[a] += ti;
+    }
+  }
+}
+async function detectTempo(buf, opts){
+  opts = opts || {};
+  const onProgress = opts.onProgress || (() => {}), perBar = Math.max(1, opts.beatsPerBar || 4), sr = buf.sampleRate, total = buf.duration;
+  if (total < 4) throw new Error('Need at least about 4 seconds of audio to detect a tempo.');
+  const w0 = total > 140 ? 10 : 0, winLen = Math.min(120, total - w0);                       // analyse up to 2 minutes, skipping a long intro
+  const D = Math.max(1, Math.round(sr / 11025)), sr2 = sr / D, n2 = Math.floor(winLen * sr / D), s0 = Math.floor(w0 * sr), nch = buf.numberOfChannels;
+  const chs = Array.from({length: nch}, (_, c) => buf.getChannelData(c)), x = new Float32Array(n2); let peak = 0;
+  for (let i = 0; i < n2; i++){ let sum = 0; const base = s0 + i * D; for (let c = 0; c < nch; c++) for (let j = 0; j < D; j++) sum += chs[c][base + j]; x[i] = sum / (D * nch); peak = Math.max(peak, Math.abs(x[i])); }
+  if (peak < 1e-4) throw new Error('This track is silent.');
+  for (let i = 0; i < n2; i++) x[i] /= peak;
+  // 1) onset strength: half-wave-rectified log-spectral flux, plus a low-band (kick) version for the downbeat
+  const N = 512, hop = 64, F = Math.floor((n2 - N) / hop) + 1, fr = sr2 / hop;
+  if (F < 300) throw new Error('Not enough audio to analyse.');
+  const win = Float64Array.from({length: N}, (_, i) => .5 - .5 * Math.cos(2 * Math.PI * i / N)), re = new Float64Array(N), im = new Float64Array(N);
+  const KMAX = Math.min(N / 2 - 1, Math.floor(5000 / (sr2 / N))), KLOW = Math.max(1, Math.floor(200 / (sr2 / N)));
+  const prev = new Float64Array(KMAX + 1), prevMag = new Float64Array(KLOW + 1), flux = new Float32Array(F), low = new Float32Array(F); let tl = performance.now();
+  for (let f = 0; f < F; f++){
+    const b = f * hop; for (let i = 0; i < N; i++){ re[i] = x[b + i] * win[i]; im[i] = 0; }
+    fft(re, im);
+    let sum = 0, sl = 0;
+    for (let k = 1; k <= KMAX; k++){
+      const mag = Math.sqrt(re[k] * re[k] + im[k] * im[k]) * 4 / N, lm = Math.log1p(30 * mag), d = lm - prev[k]; prev[k] = lm;
+      if (d > 0 && f > 0) sum += d;
+      if (k <= KLOW){ const dl = mag - prevMag[k]; prevMag[k] = mag; if (dl > 0 && f > 0) sl += dl; }          // linear, so a louder kick on the downbeat stays louder
+    }
+    flux[f] = sum; low[f] = sl;
+    if (performance.now() - tl > 40){ onProgress(f / F * .7); await new Promise(r => setTimeout(r)); tl = performance.now(); }
+  }
+  const h = Math.round(.4 * fr), detrend = a => {          // subtract a ±0.4 s moving average, keep positives
+    const pre = new Float64Array(a.length + 1), out = new Float32Array(a.length); for (let i = 0; i < a.length; i++) pre[i + 1] = pre[i] + a[i];
+    for (let i = 0; i < a.length; i++){ const lo = Math.max(0, i - h), hi = Math.min(a.length, i + h + 1); out[i] = Math.max(0, a[i] - (pre[hi] - pre[lo]) / (hi - lo)); } return out;
+  };
+  const o = detrend(flux), ol = detrend(low);     // ol = linear low-band (kick) flux
+  let omean = 0; for (let i = 0; i < F; i++) omean += o[i]; omean /= F;
+  const o99 = Array.from(o).sort((a, b) => a - b)[Math.floor(F * .99)];
+  if (omean < 1e-3) throw new Error('No clear rhythm found in this track (it has no distinct onsets).');
+  // 2) coarse tempo: autocorrelation, harmonic-summed and weighted by a prior centred on 120 BPM
+  const lagMax = Math.min(F - 2, Math.round(fr * 4.5)), ac = new Float64Array(lagMax + 1);
+  for (let lag = 1; lag <= lagMax; lag++){ let sum = 0; for (let t = 0; t < F - lag; t++) sum += o[t] * o[t + lag]; ac[lag] = sum / (F - lag); }
+  onProgress(.78);
+  const bpmOf = l => 60 * fr / l, prior = bpm => Math.exp(-.5 * Math.pow(Math.log2(bpm / 115) / .55, 2));
+  const lagLo = Math.max(2, Math.floor(fr * 60 / 215)), lagHi = Math.min(lagMax, Math.ceil(fr * 60 / 55)), score = new Float64Array(lagHi + 2);
+  for (let l = lagLo; l <= lagHi; l++){ let v = ac[l]; if (2 * l <= lagMax) v += .5 * ac[2 * l]; if (3 * l <= lagMax) v += .33 * ac[3 * l]; score[l] = v * prior(bpmOf(l)); }
+  let bl = lagLo; for (let l = lagLo; l <= lagHi; l++) if (score[l] > score[bl]) bl = l;
+  const da = score[bl - 1] || 0, db = score[bl], dc = score[bl + 1] || 0, den = da - 2 * db + dc, lagF = bl + (den ? .5 * (da - dc) / den : 0), coarse = bpmOf(lagF);
+  // 3) precise BPM + beat phase: best comb (pulse train) response within ±3% of the coarse tempo
+  const interp = q => { const i = Math.floor(q), fq = q - i; return o[i] * (1 - fq) + o[Math.min(F - 1, i + 1)] * fq; };
+  const comb = (T, p) => { let sum = 0, c = 0; for (let q = p; q < F - 1; q += T){ sum += interp(q); c++; } return c ? sum / c : 0; };
+  const grid = []; for (let bpm = coarse * .97; bpm <= coarse * 1.03; bpm += .05){ const T = 60 * fr / bpm; let bs = -1, bp = 0; for (let p = 0; p < T; p += .5){ const v = comb(T, p); if (v > bs){ bs = v; bp = p; } } grid.push({bpm, v: bs, p: bp}); }
+  let bi = 0, bv = -1; for (let i = 0; i < grid.length; i++){ const v = ((grid[i - 1] || grid[i]).v + grid[i].v + (grid[i + 1] || grid[i]).v) / 3; if (v > bv){ bv = v; bi = i; } }
+  let bpm = grid[bi].bpm, T = 60 * fr / bpm, p = grid[bi].p, bs = -1;
+  for (let q = Math.max(0, p - 1.5); q <= p + 1.5; q += .1){ const v = comb(T, q); if (v > bs){ bs = v; p = q; } }
+  onProgress(.92);
+  // 4) downbeat: which of the N beats in a bar carries the most low-frequency (kick) energy
+  const sums = new Float64Array(perBar); let k = 0;
+  for (let q = p; q < F - 3; q += T, k++){ const c = Math.round(q); let m = 0; for (let d = -1; d <= 3; d++) m = Math.max(m, ol[Math.min(F - 1, Math.max(0, c + d))]); sums[k % perBar] += m; }      // kick band only: snares and hats are broadband and would outvote it
+  let jb = 0; for (let j = 1; j < perBar; j++) if (sums[j] > sums[jb]) jb = j;
+  const lat = (N / 2) / sr2 + .004, beatSecs = T / fr, barSecs = beatSecs * perBar;          // the flux curve is stamped at each window's start: shift to the window centre (+ a measured ~4 ms attack lag)
+  const downbeat = ((w0 + (p + jb * T) / fr + lat) % barSecs + barSecs) % barSecs;
+  const ratio = bs / omean, crest = o99 / omean;
+  // confidence = peaky onsets (crest: drums ≈ 20+, pads / noise / ambience ≤ 8) that also line up on a regular grid (ratio)
+  const conf = Math.max(0, Math.min(1, (crest - 8) / 12)) * Math.max(0, Math.min(1, (ratio - 1.3) / 2.5));
+  const snapped = Math.abs(bpm - Math.round(bpm)) <= .15 ? Math.round(bpm) : Math.round(bpm * 10) / 10;
+  onProgress(1);
+  return {bpm: snapped, rawBpm: bpm, conf, offset: downbeat, beatSecs, firstBeat: ((w0 + p / fr + lat) % beatSecs + beatSecs) % beatSecs, stats: {omean, ratio, crest},
+          alts: [snapped * 2, snapped / 2].filter(v => v >= 40 && v <= 240).map(v => Math.round(v * 10) / 10)};
+}
+async function detectTempoForTrack(t){
+  if (!t || !t.orig) throw new Error('Select a track with audio first (click its name on the left).');
+  status('Detecting the tempo of “' + t.name + '”…');
+  const n = S.tempo.den === 8 ? Math.max(1, Math.round(S.tempo.num / 2)) : S.tempo.num;
+  const r = await detectTempo(t.orig, {beatsPerBar: n, onProgress: pr => status('Detecting the tempo of “' + t.name + '”… ' + Math.round(pr * 100) + '%')});
+  if (r.conf < .12) throw new Error('No steady beat found in “' + t.name + '” — it may be a vocal, pad or ambient track. Select the drums / full-song track, tap the tempo, or type a BPM.');
+  const barSecs = r.beatSecs * n, offset = ((t.offset + r.offset) % barSecs + barSecs) % barSecs;     // timeline position of a bar start
+  setTempo({bpm: r.bpm, offset: Math.min(10, offset), grid: true});
+  S.tempoInfo = {...r, track: t.name, applied: r.bpm, at: offset};
+  const strength = r.conf > .6 ? 'strong' : r.conf > .3 ? 'moderate' : 'weak';
+  const hint = r.conf <= .3 ? 'Low confidence: check that the grid lines up with the beat, or tap the tempo instead.'
+    : r.bpm < 95 ? 'If it feels twice as fast, use ' + r.bpm * 2 + ' in Tempo & grid.' : r.bpm > 165 ? 'If it feels half as fast, use ' + Math.round(r.bpm / 2 * 10) / 10 + ' in Tempo & grid.' : 'If it feels double or half, try ' + r.alts.join(' / ') + ' in Tempo & grid.';
+  status('Detected ' + r.bpm + ' BPM (' + strength + ' confidence) from “' + t.name + '” — grid on, bar 1 at ' + offset.toFixed(2) + ' s. ' + hint, r.conf <= .3);
+  if (S.tab === 'tempo') renderPanel();
+  return r;
+}
+function offerTempoDetect(t){
+  if (S.tempo.grid || !t.orig || t.orig.duration < 6) return;
+  const bar = $('#tempoBar'); $('#tempoBarTxt').textContent = 'Imported “' + t.name + '” — detect its tempo and set the grid?'; bar.hidden = false;
+  $('#tempoBarYes').onclick = () => { bar.hidden = true; S.selected = t.id; detectTempoForTrack(t).catch(e => status(e.message, true)); };
+  $('#tempoBarNo').onclick = () => { bar.hidden = true; };
+}
+
 /* ---------- metronome + tempo grid ----------
    Beat k sits at offset + k * beatSec on the timeline. The click is scheduled ~150 ms ahead against the audio clock,
    routed straight to the speakers (never through the master chain), so it is monitoring-only and never exported. */
@@ -1061,7 +1178,19 @@ function renderTempoPanel(host, sel){
   const check = (key, on) => { const c = el('input'); c.type = 'checkbox'; c.checked = !!T[key]; c.onchange = () => setTempo({[key]: c.checked}); return c; };
   const select = (opts, val, fn) => { const s2 = el('select'); opts.forEach(([v, l]) => s2.append(new Option(l, v))); s2.value = val; s2.onchange = () => fn(+s2.value); return s2; };
   const num = (id, val, min, max, step, fn) => { const i = el('input'); i.type = 'number'; i.id = id; i.min = min; i.max = max; i.step = step; i.value = val; i.onchange = () => fn(+i.value); return i; };
-  let d = sec('Tempo');
+  let d = sec('Detect tempo');
+  const selT = S.tracks.find(x => x.id === S.selected), info = S.tempoInfo;
+  const det = el('button', 'primary', '🎯 Detect from selected track'); det.disabled = !selT || !selT.orig; det.title = 'Finds the BPM and bar-1 position of an imported beat or song, then switches the grid on';
+  det.onclick = () => { det.disabled = true; detectTempoForTrack(selT).catch(e => { status(e.message, true); det.disabled = false; }); };
+  d.append(det);
+  if (!selT) d.append(Object.assign(el('div', 'hint', 'Select the beat’s track first.'), {style: 'margin-top:4px'}));
+  if (info){
+    const card = el('div', 'tempocard'), strength = info.conf > .6 ? 'strong' : info.conf > .3 ? 'moderate' : 'weak';
+    card.innerHTML = 'Last detection: <b>' + info.bpm + ' BPM</b> (' + strength + ') from “' + info.track.replace(/[<>&]/g, '') + '”<br>Bar 1 at <b>' + info.at.toFixed(2) + ' s</b> · now using <b>' + T.bpm + ' BPM</b><br>';
+    [info.bpm, ...info.alts].forEach(v => { const b2 = el('button', null, (v === info.bpm ? 'Use ' : v > info.bpm ? '×2 · ' : '÷2 · ') + v); b2.onclick = () => { setTempo({bpm: v}); renderPanel(); }; card.append(b2); });
+    d.append(card);
+  }
+  d = sec('Tempo');
   row(d, 'BPM', num('bpmPanel', T.bpm, 30, 300, .1, v => setTempo({bpm: v})));
   const tap = el('button', null, 'Tap tempo'); tap.onclick = () => tapTempo(); tap.title = 'Tap along with the beat'; row(d, '', tap);
   const ts = el('div'); ts.style.cssText = 'display:flex;gap:6px;align-items:center';
@@ -1716,7 +1845,7 @@ document.addEventListener('drop', e => {
 window.addEventListener('beforeunload', e => { if (S.unsaved && S.tracks.some(t => t.orig)){ e.preventDefault(); e.returnValue = ''; } });
 setInterval(autosave, 10000); setInterval(metroTick, 25); updateTempoUI(); checkRestore(); resetHistory();
 renderTracks(); renderPanel();
-window.__app = {encodeMp3, loadLame, applyHarmonizer, harmonyRatios, applyDoubler, splitTrack, splitAtPlayhead, applyFades, setTempo, tapTempo, beatSec, snapT, clickAt, H, undo, redo, commitHistory, resetHistory, play, curPos, makeZip, crc32, renderStem, mixTail, autosave, IDB, markDirty, buildProjectBlob, loadProjectBuffer, S, newTrack, renderMix, measure, encodeWav, ensureCtx, doAuto, refreshAll, applyGate, analyzePitch, applyTune, processTrack};
+window.__app = {detectTempo, detectTempoForTrack, encodeMp3, loadLame, applyHarmonizer, harmonyRatios, applyDoubler, splitTrack, splitAtPlayhead, applyFades, setTempo, tapTempo, beatSec, snapT, clickAt, H, undo, redo, commitHistory, resetHistory, play, curPos, makeZip, crc32, renderStem, mixTail, autosave, IDB, markDirty, buildProjectBlob, loadProjectBuffer, S, newTrack, renderMix, measure, encodeWav, ensureCtx, doAuto, refreshAll, applyGate, analyzePitch, applyTune, processTrack};
 </script>
 </body>
 </html>
